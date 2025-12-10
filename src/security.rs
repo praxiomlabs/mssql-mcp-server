@@ -1,0 +1,11 @@
+//! Security module for query validation and SQL injection prevention.
+
+mod identifiers;
+mod injection;
+mod validation;
+
+pub use identifiers::{
+    escape_identifier, parse_qualified_name, safe_identifier, validate_identifier,
+};
+pub use injection::InjectionDetector;
+pub use validation::{QueryValidator, ValidationMode, ValidationResult};
