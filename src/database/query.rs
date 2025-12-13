@@ -247,6 +247,161 @@ impl QueryExecutor {
         })
     }
 
+    /// Execute a raw SQL statement using simple_query.
+    ///
+    /// This is required for DDL statements that must be the only/first statement
+    /// in a batch, such as CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION, and
+    /// CREATE TRIGGER. The regular `query()` method uses sp_executesql which
+    /// creates its own batch context, breaking these requirements.
+    ///
+    /// This method sends raw SQL text directly without parameterization.
+    pub async fn execute_raw(&self, query: &str) -> Result<QueryResult, McpError> {
+        let start = Instant::now();
+
+        debug!("Executing raw query: {}", truncate_for_log(query, 200));
+
+        let mut conn = self.pool.get().await?;
+
+        // Use simple_query which sends raw SQL without sp_executesql wrapper
+        let results = conn
+            .simple_query(query)
+            .await
+            .map_err(|e| McpError::query_error(format!("Raw query failed: {}", e)))?
+            .into_results()
+            .await
+            .map_err(|e| McpError::query_error(format!("Failed to get results: {}", e)))?;
+
+        let result = self.convert_simple_query_results(results, start);
+
+        debug!(
+            "Raw query completed: {} rows in {} ms",
+            result.rows.len(),
+            result.execution_time_ms
+        );
+
+        Ok(result)
+    }
+
+    /// Check if a query requires raw execution (batch-first DDL statements).
+    ///
+    /// Returns true for CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION,
+    /// CREATE TRIGGER, ALTER VIEW, ALTER PROCEDURE, ALTER FUNCTION, ALTER TRIGGER.
+    pub fn requires_raw_execution(query: &str) -> bool {
+        let trimmed = query.trim();
+
+        // Remove leading comments to get to the actual statement
+        let normalized = remove_leading_sql_comments(trimmed).to_uppercase();
+
+        // Check for batch-first DDL patterns
+        let batch_first_patterns = [
+            "CREATE VIEW",
+            "CREATE PROCEDURE",
+            "CREATE PROC",
+            "CREATE FUNCTION",
+            "CREATE TRIGGER",
+            "ALTER VIEW",
+            "ALTER PROCEDURE",
+            "ALTER PROC",
+            "ALTER FUNCTION",
+            "ALTER TRIGGER",
+        ];
+
+        batch_first_patterns
+            .iter()
+            .any(|pattern| normalized.starts_with(pattern))
+    }
+
+    /// Execute a query with SHOWPLAN enabled on a dedicated connection.
+    ///
+    /// This executes SET SHOWPLAN_TEXT ON, the query, and SET SHOWPLAN_TEXT OFF
+    /// as separate batches on the same connection. SQL Server requires SHOWPLAN
+    /// to be the only statement in its batch.
+    pub async fn execute_with_showplan(
+        &self,
+        query: &str,
+        plan_type: &str,
+    ) -> Result<QueryResult, McpError> {
+        let start = Instant::now();
+
+        debug!(
+            "Executing query with showplan ({}): {}",
+            plan_type,
+            truncate_for_log(query, 200)
+        );
+
+        let mut conn = self.pool.get().await?;
+
+        // Determine which SET statements to use based on plan type
+        let (set_on, set_off) = match plan_type.to_lowercase().as_str() {
+            "actual" => (
+                "SET STATISTICS PROFILE ON; SET STATISTICS IO ON; SET STATISTICS TIME ON",
+                "SET STATISTICS PROFILE OFF; SET STATISTICS IO OFF; SET STATISTICS TIME OFF",
+            ),
+            _ => ("SET SHOWPLAN_ALL ON", "SET SHOWPLAN_ALL OFF"),
+        };
+
+        // For estimated plans, we need to execute SET SHOWPLAN separately
+        // because SQL Server requires it to be the only statement in the batch
+        if plan_type.to_lowercase() != "actual" {
+            // Execute SET SHOWPLAN_ALL ON as its own batch - must consume results
+            conn.simple_query(set_on)
+                .await
+                .map_err(|e| McpError::query_error(format!("Failed to enable SHOWPLAN: {}", e)))?
+                .into_results()
+                .await
+                .map_err(|e| McpError::query_error(format!("Failed to enable SHOWPLAN: {}", e)))?;
+
+            // Execute the query using simple_query - with SHOWPLAN ON, this returns
+            // the execution plan instead of executing the query. We use simple_query
+            // because SHOWPLAN results come back as regular result sets.
+            let results = conn
+                .simple_query(query)
+                .await
+                .map_err(|e| McpError::query_error(format!("Failed to get execution plan: {}", e)))?
+                .into_results()
+                .await
+                .map_err(|e| McpError::query_error(format!("Failed to get execution plan: {}", e)))?;
+
+            // Turn off SHOWPLAN (best effort - if this fails, the connection will be invalid
+            // but bb8 will handle that on next use)
+            if let Ok(stream) = conn.simple_query(set_off).await {
+                let _ = stream.into_results().await;
+            }
+
+            // Convert the results to our QueryResult format
+            // SHOWPLAN_ALL returns columns: StmtText, StmtId, NodeId, Parent, PhysicalOp,
+            // LogicalOp, Argument, DefinedValues, EstimateRows, EstimateIO, EstimateCPU,
+            // AvgRowSize, TotalSubtreeCost, OutputList, Warnings, Type, Parallel, EstimateExecutions
+            let result = self.convert_simple_query_results(results, start);
+
+            debug!(
+                "Showplan query completed: {} rows in {} ms",
+                result.rows.len(),
+                result.execution_time_ms
+            );
+
+            Ok(result)
+        } else {
+            // For actual execution plans, we can use STATISTICS which don't have
+            // the same batch restriction
+            let full_query = format!("{}\n{}\n{}", set_on, query, set_off);
+            let stream = conn
+                .query(&full_query, &[])
+                .await
+                .map_err(|e| McpError::query_error(format!("Failed to execute with statistics: {}", e)))?;
+
+            let result = self.process_stream(stream, self.max_rows, start).await?;
+
+            debug!(
+                "Statistics query completed: {} rows in {} ms",
+                result.rows.len(),
+                result.execution_time_ms
+            );
+
+            Ok(result)
+        }
+    }
+
     /// Process a query stream into a QueryResult.
     async fn process_stream(
         &self,
@@ -306,6 +461,156 @@ impl QueryExecutor {
             truncated,
         })
     }
+
+    /// Convert results from simple_query().into_results() to our QueryResult format.
+    ///
+    /// This is used for SHOWPLAN queries where we need to use simple_query instead
+    /// of the parameterized query method.
+    fn convert_simple_query_results(
+        &self,
+        results: Vec<Vec<tiberius::Row>>,
+        start: Instant,
+    ) -> QueryResult {
+        let mut columns: Vec<ColumnInfo> = Vec::new();
+        let mut rows: Vec<ResultRow> = Vec::new();
+
+        for result_set in results {
+            // Process each row in the result set
+            for row in result_set {
+                // Extract column info from the first row if we haven't yet
+                if columns.is_empty() {
+                    columns = row
+                        .columns()
+                        .iter()
+                        .map(|col| ColumnInfo {
+                            name: col.name().to_string(),
+                            sql_type: TypeMapper::sql_type_name(col).to_string(),
+                            nullable: true,
+                        })
+                        .collect();
+                }
+
+                // Extract row data
+                let mut result_row = ResultRow::new();
+                for (idx, col) in columns.iter().enumerate() {
+                    let value = TypeMapper::extract_column(&row, idx);
+                    result_row.insert(col.name.clone(), value);
+                }
+                rows.push(result_row);
+            }
+        }
+
+        QueryResult {
+            columns,
+            rows,
+            rows_affected: 0,
+            execution_time_ms: start.elapsed().as_millis() as u64,
+            truncated: false,
+        }
+    }
+
+    /// Execute a multi-batch query, splitting on GO separators.
+    ///
+    /// GO is not a T-SQL command - it's a batch separator used by tools like SSMS.
+    /// This method splits the script on GO and executes each batch sequentially.
+    /// Results from all batches are combined into a single result.
+    pub async fn execute_multi_batch(&self, script: &str) -> Result<QueryResult, McpError> {
+        let start = Instant::now();
+        let batches = split_on_go(script);
+
+        debug!("Executing multi-batch query with {} batch(es)", batches.len());
+
+        let mut combined_columns: Vec<ColumnInfo> = Vec::new();
+        let mut combined_rows: Vec<ResultRow> = Vec::new();
+        let mut batch_num = 0;
+
+        let mut conn = self.pool.get().await?;
+
+        for batch in batches {
+            let trimmed = batch.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            batch_num += 1;
+            debug!("Executing batch {}: {}", batch_num, truncate_for_log(trimmed, 100));
+
+            // Use simple_query for each batch so DDL works correctly
+            let results = conn
+                .simple_query(trimmed)
+                .await
+                .map_err(|e| McpError::query_error(format!("Batch {} failed: {}", batch_num, e)))?
+                .into_results()
+                .await
+                .map_err(|e| McpError::query_error(format!("Batch {} failed: {}", batch_num, e)))?;
+
+            // Process results from this batch
+            for result_set in results {
+                for row in result_set {
+                    // Extract column info from the first row if we haven't yet
+                    if combined_columns.is_empty() {
+                        combined_columns = row
+                            .columns()
+                            .iter()
+                            .map(|col| ColumnInfo {
+                                name: col.name().to_string(),
+                                sql_type: TypeMapper::sql_type_name(col).to_string(),
+                                nullable: true,
+                            })
+                            .collect();
+                    }
+
+                    // Check row limit
+                    if combined_rows.len() >= self.max_rows {
+                        continue;
+                    }
+
+                    // Extract row data
+                    let mut result_row = ResultRow::new();
+                    for (idx, col) in combined_columns.iter().enumerate() {
+                        let value = TypeMapper::extract_column(&row, idx);
+                        result_row.insert(col.name.clone(), value);
+                    }
+                    combined_rows.push(result_row);
+                }
+            }
+        }
+
+        let truncated = combined_rows.len() >= self.max_rows;
+
+        debug!(
+            "Multi-batch query completed: {} batches, {} rows in {} ms",
+            batch_num,
+            combined_rows.len(),
+            start.elapsed().as_millis()
+        );
+
+        Ok(QueryResult {
+            columns: combined_columns,
+            rows: combined_rows,
+            rows_affected: 0, // Multi-batch doesn't track rows affected
+            execution_time_ms: start.elapsed().as_millis() as u64,
+            truncated,
+        })
+    }
+
+    /// Check if a query contains GO batch separators.
+    pub fn contains_go_separator(query: &str) -> bool {
+        // GO must be on its own line (possibly with whitespace)
+        for line in query.lines() {
+            let trimmed = line.trim();
+            if trimmed.eq_ignore_ascii_case("GO") {
+                return true;
+            }
+            // Also match "GO n" for repeated execution (e.g., "GO 5")
+            if trimmed.to_uppercase().starts_with("GO ")
+                && trimmed[3..].trim().chars().all(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Truncate a string for logging purposes.
@@ -315,6 +620,96 @@ fn truncate_for_log(s: &str, max_len: usize) -> String {
     } else {
         format!("{}...", &s[..max_len])
     }
+}
+
+/// Split a SQL script on GO batch separators.
+///
+/// GO must be on its own line (possibly with whitespace and optional count).
+/// Returns a vector of batch strings.
+fn split_on_go(script: &str) -> Vec<String> {
+    let mut batches = Vec::new();
+    let mut current_batch = String::new();
+
+    for line in script.lines() {
+        let trimmed = line.trim();
+
+        // Check if this line is a GO statement
+        let (is_go, repeat_count) = if trimmed.eq_ignore_ascii_case("GO") {
+            (true, 1)
+        } else if trimmed.to_uppercase().starts_with("GO ") {
+            // Check for "GO n" syntax
+            let count_str = trimmed[3..].trim();
+            if let Ok(n) = count_str.parse::<usize>() {
+                (true, n.max(1))
+            } else {
+                (false, 1)
+            }
+        } else {
+            (false, 1)
+        };
+
+        if is_go {
+            // End current batch and add it (potentially multiple times for GO n)
+            let batch = current_batch.trim().to_string();
+            if !batch.is_empty() {
+                for _ in 0..repeat_count {
+                    batches.push(batch.clone());
+                }
+            }
+            current_batch.clear();
+        } else {
+            // Add line to current batch
+            if !current_batch.is_empty() {
+                current_batch.push('\n');
+            }
+            current_batch.push_str(line);
+        }
+    }
+
+    // Add final batch if not empty
+    let batch = current_batch.trim().to_string();
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    batches
+}
+
+/// Remove leading SQL comments from a query string.
+///
+/// This handles both line comments (--) and block comments (/* */).
+fn remove_leading_sql_comments(query: &str) -> String {
+    let mut result = query.to_string();
+
+    loop {
+        let trimmed = result.trim_start();
+
+        // Remove line comments
+        if trimmed.starts_with("--") {
+            if let Some(newline_pos) = trimmed.find('\n') {
+                result = trimmed[newline_pos + 1..].to_string();
+                continue;
+            } else {
+                // Entire query is a comment
+                return String::new();
+            }
+        }
+
+        // Remove block comments
+        if trimmed.starts_with("/*") {
+            if let Some(end_pos) = trimmed.find("*/") {
+                result = trimmed[end_pos + 2..].to_string();
+                continue;
+            } else {
+                // Unclosed comment
+                return String::new();
+            }
+        }
+
+        break;
+    }
+
+    result.trim_start().to_string()
 }
 
 #[cfg(test)]
