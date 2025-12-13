@@ -16,6 +16,10 @@
 //! - `mssql://views/{schema}/{view}` - View details with definition
 //! - `mssql://procedures` - List of stored procedures
 //! - `mssql://procedures/{schema}/{procedure}` - Procedure details with parameters
+//! - `mssql://functions` - List of user-defined functions
+//! - `mssql://functions/{schema}/{function}` - Function details with parameters
+//! - `mssql://triggers` - List of database triggers
+//! - `mssql://triggers/{schema}/{trigger}` - Trigger details with definition
 
 use crate::security::{parse_qualified_name, validate_identifier};
 use crate::server::MssqlMcpServer;
@@ -69,6 +73,18 @@ pub fn build_resource_list(server: &MssqlMcpServer) -> Vec<Resource> {
                 "List of stored procedures",
                 "application/json",
             ),
+            create_resource(
+                "mssql://functions",
+                "Functions",
+                "List of user-defined functions (scalar and table-valued)",
+                "application/json",
+            ),
+            create_resource(
+                "mssql://triggers",
+                "Triggers",
+                "List of database triggers",
+                "application/json",
+            ),
         ]);
     }
 
@@ -98,6 +114,18 @@ pub fn build_resource_templates(server: &MssqlMcpServer) -> Vec<ResourceTemplate
                 "mssql://procedures/{schema}/{procedure}",
                 "Procedure Details",
                 "Get detailed information about a stored procedure",
+                "application/json",
+            ),
+            create_resource_template(
+                "mssql://functions/{schema}/{function}",
+                "Function Details",
+                "Get detailed information about a user-defined function",
+                "application/json",
+            ),
+            create_resource_template(
+                "mssql://triggers/{schema}/{trigger}",
+                "Trigger Details",
+                "Get detailed information about a trigger",
                 "application/json",
             ),
         ]);
@@ -130,6 +158,14 @@ pub async fn read_resource(
         ResourceUri::ProcedureDetails { schema, procedure } => {
             read_procedure_details(server, &schema, &procedure).await?
         }
+        ResourceUri::Functions => read_functions(server).await?,
+        ResourceUri::FunctionDetails { schema, function } => {
+            read_function_details(server, &schema, &function).await?
+        }
+        ResourceUri::Triggers => read_triggers(server).await?,
+        ResourceUri::TriggerDetails { schema, trigger } => {
+            read_trigger_details(server, &schema, &trigger).await?
+        }
     };
 
     Ok(ReadResourceResult {
@@ -153,6 +189,10 @@ enum ResourceUri {
     ViewDetails { schema: String, view: String },
     Procedures,
     ProcedureDetails { schema: String, procedure: String },
+    Functions,
+    FunctionDetails { schema: String, function: String },
+    Triggers,
+    TriggerDetails { schema: String, trigger: String },
 }
 
 /// Error type for resource URI parsing with detailed context.
@@ -192,7 +232,7 @@ impl std::fmt::Display for ResourceParseError {
             ParseErrorReason::UnknownResourceType { segment } => {
                 write!(
                     f,
-                    "unknown resource type '{}'. Valid types: server, databases, schemas, tables, views, procedures",
+                    "unknown resource type '{}'. Valid types: server, databases, schemas, tables, views, procedures, functions, triggers",
                     segment
                 )
             }
@@ -293,6 +333,38 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceUri, ResourceParseError> {
                 .map(|(s, p)| ResourceUri::ProcedureDetails { schema: s, procedure: p })
         }
         ["procedures", ..] => Err(ResourceParseError {
+            uri: uri.to_string(),
+            reason: ParseErrorReason::TooManySegments {
+                expected: 3,
+                got: segments.len(),
+            },
+        }),
+        ["functions"] => Ok(ResourceUri::Functions),
+        ["functions", qualified] => {
+            parse_and_validate_qualified_name(qualified, uri)
+                .map(|(schema, function)| ResourceUri::FunctionDetails { schema, function })
+        }
+        ["functions", schema, function] => {
+            validate_schema_and_name(schema, function, uri)
+                .map(|(s, f)| ResourceUri::FunctionDetails { schema: s, function: f })
+        }
+        ["functions", ..] => Err(ResourceParseError {
+            uri: uri.to_string(),
+            reason: ParseErrorReason::TooManySegments {
+                expected: 3,
+                got: segments.len(),
+            },
+        }),
+        ["triggers"] => Ok(ResourceUri::Triggers),
+        ["triggers", qualified] => {
+            parse_and_validate_qualified_name(qualified, uri)
+                .map(|(schema, trigger)| ResourceUri::TriggerDetails { schema, trigger })
+        }
+        ["triggers", schema, trigger] => {
+            validate_schema_and_name(schema, trigger, uri)
+                .map(|(s, t)| ResourceUri::TriggerDetails { schema: s, trigger: t })
+        }
+        ["triggers", ..] => Err(ResourceParseError {
             uri: uri.to_string(),
             reason: ParseErrorReason::TooManySegments {
                 expected: 3,
@@ -558,6 +630,107 @@ async fn read_procedure_details(
         "definition": definition,
         "parameter_count": parameters.len(),
         "parameters": parameters,
+    });
+
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+async fn read_functions(server: &MssqlMcpServer) -> Result<String, String> {
+    let functions = server
+        .metadata
+        .list_functions(None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let response = json!({
+        "count": functions.len(),
+        "functions": functions,
+    });
+
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+async fn read_function_details(
+    server: &MssqlMcpServer,
+    schema: &str,
+    function: &str,
+) -> Result<String, String> {
+    // Get functions filtered by schema
+    let functions = server
+        .metadata
+        .list_functions(Some(schema))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let func_info = functions
+        .iter()
+        .find(|f| f.function_name.eq_ignore_ascii_case(function))
+        .ok_or_else(|| format!("Function not found: {}.{}", schema, function))?;
+
+    // Get function parameters
+    let parameters = server
+        .metadata
+        .get_function_parameters(schema, function)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let response = json!({
+        "schema": func_info.schema_name,
+        "function": func_info.function_name,
+        "type": func_info.function_type,
+        "return_type": func_info.return_type,
+        "created": func_info.create_date,
+        "modified": func_info.modify_date,
+        "parameter_count": parameters.len(),
+        "parameters": parameters,
+        "definition": func_info.definition,
+    });
+
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+async fn read_triggers(server: &MssqlMcpServer) -> Result<String, String> {
+    let triggers = server
+        .metadata
+        .list_triggers(None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let response = json!({
+        "count": triggers.len(),
+        "triggers": triggers,
+    });
+
+    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
+}
+
+async fn read_trigger_details(
+    server: &MssqlMcpServer,
+    schema: &str,
+    trigger: &str,
+) -> Result<String, String> {
+    // Get triggers filtered by schema
+    let triggers = server
+        .metadata
+        .list_triggers(Some(schema))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let trigger_info = triggers
+        .iter()
+        .find(|t| t.trigger_name.eq_ignore_ascii_case(trigger))
+        .ok_or_else(|| format!("Trigger not found: {}.{}", schema, trigger))?;
+
+    let response = json!({
+        "schema": trigger_info.schema_name,
+        "trigger": trigger_info.trigger_name,
+        "parent_object": trigger_info.parent_object,
+        "type": trigger_info.trigger_type,
+        "status": if trigger_info.is_disabled { "Disabled" } else { "Enabled" },
+        "events": trigger_info.trigger_events,
+        "created": trigger_info.create_date,
+        "modified": trigger_info.modify_date,
+        "definition": trigger_info.definition,
     });
 
     serde_json::to_string_pretty(&response).map_err(|e| e.to_string())
