@@ -1,7 +1,7 @@
 //! MCP server struct definition and initialization.
 
 use crate::config::Config;
-use crate::database::{create_pool, ConnectionPool, MetadataQueries, QueryExecutor};
+use crate::database::{create_pool, ConnectionPool, MetadataQueries, QueryExecutor, SessionManager, TransactionManager};
 use crate::error::McpError;
 use crate::security::QueryValidator;
 use crate::state::{new_shared_state, SharedState};
@@ -42,6 +42,12 @@ pub struct MssqlMcpServer {
 
     /// Server metrics for telemetry.
     pub(crate) metrics: SharedMetrics,
+
+    /// Transaction manager for dedicated transaction connections.
+    pub(crate) transaction_manager: Arc<TransactionManager>,
+
+    /// Session manager for pinned connections (temp tables, session state).
+    pub(crate) session_manager: Arc<SessionManager>,
 }
 
 impl MssqlMcpServer {
@@ -89,6 +95,20 @@ impl MssqlMcpServer {
         // Create metrics collector
         let metrics = new_shared_metrics();
 
+        // Create transaction manager with database config
+        let db_config = Arc::new(config.database.clone());
+        let transaction_manager = Arc::new(TransactionManager::new(
+            db_config.clone(),
+            config.security.max_result_rows,
+        ));
+
+        // Create session manager for pinned connections
+        let session_manager = Arc::new(SessionManager::new(
+            db_config,
+            config.security.max_result_rows,
+            config.session.result_retention, // Use result retention as session timeout
+        ));
+
         Ok(Self {
             state,
             pool,
@@ -98,6 +118,8 @@ impl MssqlMcpServer {
             validator,
             tool_router,
             metrics,
+            transaction_manager,
+            session_manager,
         })
     }
 
@@ -142,6 +164,16 @@ impl MssqlMcpServer {
     /// Get a reference to the metrics collector.
     pub fn metrics(&self) -> &SharedMetrics {
         &self.metrics
+    }
+
+    /// Get a reference to the transaction manager.
+    pub fn transaction_manager(&self) -> &TransactionManager {
+        &self.transaction_manager
+    }
+
+    /// Get a reference to the session manager.
+    pub fn session_manager(&self) -> &SessionManager {
+        &self.session_manager
     }
 
     /// Check if the server is in database mode (connected to specific database).
