@@ -75,6 +75,42 @@ pub struct ProcedureParameter {
     pub default_value: Option<String>,
 }
 
+/// Function metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionInfo {
+    pub schema_name: String,
+    pub function_name: String,
+    pub function_type: String,
+    pub return_type: Option<String>,
+    pub create_date: String,
+    pub modify_date: String,
+    pub definition: Option<String>,
+}
+
+/// Function parameter metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionParameter {
+    pub parameter_name: String,
+    pub ordinal_position: i32,
+    pub data_type: String,
+    pub max_length: Option<i32>,
+    pub is_output: bool,
+}
+
+/// Trigger metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerInfo {
+    pub schema_name: String,
+    pub trigger_name: String,
+    pub parent_object: String,
+    pub trigger_type: String,
+    pub is_disabled: bool,
+    pub trigger_events: String,
+    pub create_date: String,
+    pub modify_date: String,
+    pub definition: Option<String>,
+}
+
 /// Server information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -102,15 +138,17 @@ impl MetadataQueries {
 
     /// Get server information.
     pub async fn get_server_info(&self) -> Result<ServerInfo, McpError> {
+        // Note: SERVERPROPERTY() returns sql_variant which tiberius doesn't support.
+        // We must cast all SERVERPROPERTY results to explicit types.
         let query = r#"
             SELECT
-                SERVERPROPERTY('ProductVersion') AS product_version,
-                SERVERPROPERTY('ProductLevel') AS product_level,
-                SERVERPROPERTY('Edition') AS edition,
-                SERVERPROPERTY('EngineEdition') AS engine_edition,
+                CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) AS product_version,
+                CAST(SERVERPROPERTY('ProductLevel') AS NVARCHAR(128)) AS product_level,
+                CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128)) AS edition,
+                CAST(SERVERPROPERTY('EngineEdition') AS INT) AS engine_edition,
                 @@SERVERNAME AS server_name,
-                SERVERPROPERTY('IsClustered') AS is_clustered,
-                SERVERPROPERTY('Collation') AS collation
+                CAST(SERVERPROPERTY('IsClustered') AS INT) AS is_clustered,
+                CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128)) AS collation
         "#;
 
         let result = self.executor.execute(query).await?;
@@ -417,6 +455,150 @@ impl MetadataQueries {
                 is_output: extract_bool(row, "is_output").unwrap_or(false),
                 has_default: extract_bool(row, "has_default").unwrap_or(false),
                 default_value: extract_string(row, "default_value"),
+            })
+            .collect())
+    }
+
+    /// List functions in a schema.
+    pub async fn list_functions(&self, schema: Option<&str>) -> Result<Vec<FunctionInfo>, McpError> {
+        let query = format!(
+            r#"
+            SELECT
+                s.name AS schema_name,
+                o.name AS function_name,
+                CASE o.type
+                    WHEN 'FN' THEN 'Scalar'
+                    WHEN 'IF' THEN 'Inline Table-Valued'
+                    WHEN 'TF' THEN 'Table-Valued'
+                    WHEN 'AF' THEN 'Aggregate'
+                    ELSE o.type
+                END AS function_type,
+                TYPE_NAME(ISNULL(
+                    (SELECT TOP 1 user_type_id FROM sys.parameters WHERE object_id = o.object_id AND parameter_id = 0),
+                    0
+                )) AS return_type,
+                CONVERT(VARCHAR(23), o.create_date, 121) AS create_date,
+                CONVERT(VARCHAR(23), o.modify_date, 121) AS modify_date,
+                m.definition AS definition
+            FROM sys.objects o
+            INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+            LEFT JOIN sys.sql_modules m ON o.object_id = m.object_id
+            WHERE o.type IN ('FN', 'IF', 'TF', 'AF')
+            AND o.is_ms_shipped = 0
+            {}
+            ORDER BY s.name, o.name
+        "#,
+            schema
+                .map(|s| format!("AND s.name = '{}'", s.replace('\'', "''")))
+                .unwrap_or_default()
+        );
+
+        let result = self.executor.execute(&query).await?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| FunctionInfo {
+                schema_name: extract_string(row, "schema_name").unwrap_or_default(),
+                function_name: extract_string(row, "function_name").unwrap_or_default(),
+                function_type: extract_string(row, "function_type").unwrap_or_default(),
+                return_type: extract_string(row, "return_type"),
+                create_date: extract_string(row, "create_date").unwrap_or_default(),
+                modify_date: extract_string(row, "modify_date").unwrap_or_default(),
+                definition: extract_string(row, "definition"),
+            })
+            .collect())
+    }
+
+    /// Get parameters for a function.
+    pub async fn get_function_parameters(
+        &self,
+        schema: &str,
+        function: &str,
+    ) -> Result<Vec<FunctionParameter>, McpError> {
+        let query = format!(
+            r#"
+            SELECT
+                p.name AS parameter_name,
+                p.parameter_id AS ordinal_position,
+                TYPE_NAME(p.user_type_id) AS data_type,
+                p.max_length AS max_length,
+                p.is_output AS is_output
+            FROM sys.parameters p
+            INNER JOIN sys.objects o ON p.object_id = o.object_id
+            INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+            WHERE o.type IN ('FN', 'IF', 'TF', 'AF')
+            AND s.name = '{}'
+            AND o.name = '{}'
+            AND p.parameter_id > 0
+            ORDER BY p.parameter_id
+        "#,
+            schema.replace('\'', "''"),
+            function.replace('\'', "''")
+        );
+
+        let result = self.executor.execute(&query).await?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| FunctionParameter {
+                parameter_name: extract_string(row, "parameter_name").unwrap_or_default(),
+                ordinal_position: extract_i32(row, "ordinal_position").unwrap_or(0),
+                data_type: extract_string(row, "data_type").unwrap_or_default(),
+                max_length: extract_i32(row, "max_length"),
+                is_output: extract_bool(row, "is_output").unwrap_or(false),
+            })
+            .collect())
+    }
+
+    /// List triggers in a schema.
+    pub async fn list_triggers(&self, schema: Option<&str>) -> Result<Vec<TriggerInfo>, McpError> {
+        let query = format!(
+            r#"
+            SELECT
+                s.name AS schema_name,
+                t.name AS trigger_name,
+                OBJECT_NAME(t.parent_id) AS parent_object,
+                CASE WHEN t.type = 'TR' THEN 'DML' ELSE 'DDL' END AS trigger_type,
+                t.is_disabled AS is_disabled,
+                STUFF((
+                    SELECT ', ' + te.type_desc
+                    FROM sys.trigger_events te
+                    WHERE te.object_id = t.object_id
+                    FOR XML PATH(''), TYPE
+                ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS trigger_events,
+                CONVERT(VARCHAR(23), t.create_date, 121) AS create_date,
+                CONVERT(VARCHAR(23), t.modify_date, 121) AS modify_date,
+                m.definition AS definition
+            FROM sys.triggers t
+            INNER JOIN sys.objects o ON t.parent_id = o.object_id
+            INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+            LEFT JOIN sys.sql_modules m ON t.object_id = m.object_id
+            WHERE t.is_ms_shipped = 0
+            {}
+            ORDER BY s.name, t.name
+        "#,
+            schema
+                .map(|s| format!("AND s.name = '{}'", s.replace('\'', "''")))
+                .unwrap_or_default()
+        );
+
+        let result = self.executor.execute(&query).await?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| TriggerInfo {
+                schema_name: extract_string(row, "schema_name").unwrap_or_default(),
+                trigger_name: extract_string(row, "trigger_name").unwrap_or_default(),
+                parent_object: extract_string(row, "parent_object").unwrap_or_default(),
+                trigger_type: extract_string(row, "trigger_type").unwrap_or_default(),
+                is_disabled: extract_bool(row, "is_disabled").unwrap_or(false),
+                trigger_events: extract_string(row, "trigger_events").unwrap_or_default(),
+                create_date: extract_string(row, "create_date").unwrap_or_default(),
+                modify_date: extract_string(row, "modify_date").unwrap_or_default(),
+                definition: extract_string(row, "definition"),
             })
             .collect())
     }
