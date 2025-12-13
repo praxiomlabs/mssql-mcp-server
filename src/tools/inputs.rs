@@ -715,3 +715,50 @@ pub struct GetInternalMetricsInput {
     #[schemars(description = "Include calculated rates and averages (default: true)")]
     pub include_rates: bool,
 }
+
+// =========================================================================
+// Pinned Session Inputs
+// =========================================================================
+
+/// Input for the `begin_pinned_session` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BeginPinnedSessionInput {
+    /// Optional session name for identification.
+    #[serde(default)]
+    #[schemars(description = "Optional name for the pinned session (for identification)")]
+    pub name: Option<String>,
+}
+
+/// Input for the `execute_in_pinned_session` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExecuteInPinnedSessionInput {
+    /// Session ID returned from begin_pinned_session.
+    #[schemars(description = "Session ID from begin_pinned_session")]
+    pub session_id: String,
+
+    /// The SQL statement to execute within the session.
+    #[schemars(description = "SQL statement to execute within the pinned session")]
+    pub query: String,
+
+    /// Output format for query results.
+    #[serde(default)]
+    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    pub format: OutputFormat,
+}
+
+/// Input for the `end_pinned_session` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EndPinnedSessionInput {
+    /// Session ID returned from begin_pinned_session.
+    #[schemars(description = "Session ID from begin_pinned_session")]
+    pub session_id: String,
+}
+
+/// Input for the `list_pinned_sessions` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ListPinnedSessionsInput {
+    /// Whether to include detailed session statistics.
+    #[serde(default)]
+    #[schemars(description = "Include detailed statistics for each session (default: false)")]
+    pub detailed: bool,
+}

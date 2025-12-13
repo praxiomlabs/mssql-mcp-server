@@ -19,6 +19,10 @@
 //! - `commit_transaction`: Commit a transaction
 //! - `rollback_transaction`: Rollback a transaction
 //! - `execute_in_transaction`: Execute SQL in a transaction
+//! - `begin_pinned_session`: Start a pinned session for temp tables
+//! - `execute_in_pinned_session`: Execute SQL in a pinned session
+//! - `end_pinned_session`: End a pinned session
+//! - `list_pinned_sessions`: List active pinned sessions
 //! - `switch_database`: Switch to a different database
 //! - `recommend_indexes`: Get index recommendations for a query
 //! - `compare_schemas`: Compare two database schemas
@@ -80,6 +84,8 @@ impl MssqlMcpServer {
         &self,
         Parameters(input): Parameters<ExecuteQueryInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        use crate::database::QueryExecutor;
+
         debug!("Executing query: {}", truncate_for_log(&input.query, 100));
 
         // Validate the query
@@ -92,12 +98,36 @@ impl MssqlMcpServer {
             .max_rows
             .unwrap_or(self.config.security.max_result_rows);
 
-        // Execute the query
-        let result = match self.executor.execute_with_limit(&input.query, max_rows).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Query execution failed: {}", e);
-                return Ok(tool_error(format!("Query execution failed: {}", e)));
+        // Check if this is a multi-batch query with GO separators
+        // If so, split and execute each batch sequentially
+        let result = if QueryExecutor::contains_go_separator(&input.query) {
+            debug!("Using multi-batch execution for script with GO separators");
+            match self.executor.execute_multi_batch(&input.query).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Multi-batch execution failed: {}", e);
+                    return Ok(tool_error(format!("Query execution failed: {}", e)));
+                }
+            }
+        } else if QueryExecutor::requires_raw_execution(&input.query) {
+            // Batch-first DDL statements (CREATE VIEW/PROC/FUNC/TRIGGER)
+            // must be executed using simple_query to avoid sp_executesql wrapper
+            debug!("Using raw execution for batch-first DDL statement");
+            match self.executor.execute_raw(&input.query).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Raw query execution failed: {}", e);
+                    return Ok(tool_error(format!("Query execution failed: {}", e)));
+                }
+            }
+        } else {
+            // Execute the query using standard parameterized method
+            match self.executor.execute_with_limit(&input.query, max_rows).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Query execution failed: {}", e);
+                    return Ok(tool_error(format!("Query execution failed: {}", e)));
+                }
             }
         };
 
@@ -128,20 +158,12 @@ impl MssqlMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         debug!("Explaining query: {}", truncate_for_log(&input.query, 100));
 
-        // Build the SET statement based on plan type
-        let (set_on, set_off) = match input.plan_type.to_lowercase().as_str() {
-            "actual" => (
-                "SET STATISTICS PROFILE ON; SET STATISTICS IO ON; SET STATISTICS TIME ON;",
-                "SET STATISTICS PROFILE OFF; SET STATISTICS IO OFF; SET STATISTICS TIME OFF;",
-            ),
-            _ => ("SET SHOWPLAN_TEXT ON;", "SET SHOWPLAN_TEXT OFF;"),
-        };
-
-        // For estimated plan, we just show the plan without executing
-        let query = format!("{}\n{}\n{}", set_on, input.query, set_off);
-
-        // Execute to get the plan
-        let result = match self.executor.execute(&query).await {
+        // Use the executor's showplan method which handles the batch separation correctly
+        let result = match self
+            .executor
+            .execute_with_showplan(&input.query, &input.plan_type)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 return Ok(tool_error(format!("Failed to get execution plan: {}", e)));
@@ -758,7 +780,7 @@ impl MssqlMcpServer {
         let isolation_level = IsolationLevel::from_str(&input.isolation_level)
             .unwrap_or(IsolationLevel::ReadCommitted);
 
-        // Create transaction state
+        // Create transaction state (this generates the transaction ID)
         let transaction_id = {
             let mut state = self.state.write().await;
             match state.create_transaction(
@@ -773,23 +795,23 @@ impl MssqlMcpServer {
             }
         };
 
-        // Execute BEGIN TRANSACTION with isolation level
-        let set_isolation = format!("SET TRANSACTION ISOLATION LEVEL {}", isolation_level);
-        let begin_tx = match &input.name {
-            Some(name) => format!("BEGIN TRANSACTION [{}]", name.replace(']', "]]")),
-            None => "BEGIN TRANSACTION".to_string(),
-        };
-
-        let query = format!("{}; {}", set_isolation, begin_tx);
-
-        if let Err(e) = self.executor.execute(&query).await {
+        // Use TransactionManager to create dedicated connection and begin transaction
+        if let Err(e) = self
+            .transaction_manager
+            .begin_transaction(
+                &transaction_id,
+                &isolation_level.to_string(),
+                input.name.as_deref(),
+            )
+            .await
+        {
             // Clean up state on failure
             let mut state = self.state.write().await;
             state.remove_transaction(&transaction_id);
             return Ok(tool_error(format!("Failed to begin transaction: {}", e)));
         }
 
-        info!("Transaction {} started", transaction_id);
+        info!("Transaction {} started with dedicated connection", transaction_id);
 
         let response = json!({
             "transaction_id": transaction_id,
@@ -816,8 +838,8 @@ impl MssqlMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         debug!("Committing transaction: {}", input.transaction_id);
 
-        // Check transaction exists and is active
-        {
+        // Check transaction exists and is active, get the name
+        let tx_name = {
             let state = self.state.read().await;
             match state.get_transaction(&input.transaction_id) {
                 Some(tx) if tx.status != TransactionStatus::Active => {
@@ -832,12 +854,16 @@ impl MssqlMcpServer {
                         input.transaction_id
                     )));
                 }
-                _ => {}
+                Some(tx) => tx.name.clone(),
             }
-        }
+        };
 
-        // Execute COMMIT
-        if let Err(e) = self.executor.execute("COMMIT TRANSACTION").await {
+        // Use TransactionManager to commit on the dedicated connection
+        if let Err(e) = self
+            .transaction_manager
+            .commit_transaction(&input.transaction_id, tx_name.as_deref())
+            .await
+        {
             return Ok(tool_error(format!("Failed to commit transaction: {}", e)));
         }
 
@@ -898,21 +924,24 @@ impl MssqlMcpServer {
             }
         };
 
-        // Build ROLLBACK statement
-        let rollback_sql = match &input.savepoint {
-            Some(sp) => format!("ROLLBACK TRANSACTION [{}]", sp.replace(']', "]]")),
-            None => match &tx_name {
-                Some(name) => format!("ROLLBACK TRANSACTION [{}]", name.replace(']', "]]")),
-                None => "ROLLBACK TRANSACTION".to_string(),
-            },
+        // Use TransactionManager to rollback on the dedicated connection
+        let transaction_ended = match self
+            .transaction_manager
+            .rollback_transaction(
+                &input.transaction_id,
+                tx_name.as_deref(),
+                input.savepoint.as_deref(),
+            )
+            .await
+        {
+            Ok(ended) => ended,
+            Err(e) => {
+                return Ok(tool_error(format!("Failed to rollback transaction: {}", e)));
+            }
         };
 
-        if let Err(e) = self.executor.execute(&rollback_sql).await {
-            return Ok(tool_error(format!("Failed to rollback transaction: {}", e)));
-        }
-
         // Update state (only if full rollback, not savepoint)
-        if input.savepoint.is_none() {
+        if transaction_ended {
             let mut state = self.state.write().await;
             if let Some(tx) = state.get_transaction_mut(&input.transaction_id) {
                 tx.rollback();
@@ -999,8 +1028,12 @@ impl MssqlMcpServer {
             }
         };
 
-        // Execute the query
-        let result = match self.executor.execute(&query).await {
+        // Execute the query using TransactionManager on the dedicated connection
+        let result = match self
+            .transaction_manager
+            .execute_in_transaction(&input.transaction_id, &query)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!("Transaction query failed: {}", e);
@@ -1018,6 +1051,178 @@ impl MssqlMcpServer {
 
         let output = result.to_markdown_table();
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // =========================================================================
+    // Pinned Session Tools (for temp tables, session state)
+    // =========================================================================
+
+    /// Begin a pinned session for temp tables and session state.
+    ///
+    /// Pinned sessions hold a dedicated connection, allowing temp tables (#tables),
+    /// session variables, and SET options to persist across multiple queries.
+    #[tool(
+        name = "begin_pinned_session",
+        description = "Start a pinned session with a dedicated connection. Use for temp tables (#tables) and session-scoped state that needs to persist across queries."
+    )]
+    pub async fn begin_pinned_session(
+        &self,
+        Parameters(input): Parameters<BeginPinnedSessionInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        debug!("Beginning pinned session");
+
+        // Generate session ID
+        let session_id = format!("session_{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"));
+
+        // Create the session
+        let session_info = match self
+            .session_manager
+            .begin_session(&session_id)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                return Ok(tool_error(format!("Failed to begin session: {}", e)));
+            }
+        };
+
+        info!("Pinned session {} started with dedicated connection", session_id);
+
+        let response = json!({
+            "session_id": session_id,
+            "name": input.name,
+            "status": "active",
+            "created_at": format!("{:?}", session_info.created_at.elapsed()),
+            "message": "Pinned session started. Use execute_in_pinned_session for temp tables and session state. Remember to call end_pinned_session when done."
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| format!("Session ID: {}", session_id)),
+        )]))
+    }
+
+    /// Execute SQL within a pinned session.
+    #[tool(
+        name = "execute_in_pinned_session",
+        description = "Execute a SQL statement within a pinned session. Temp tables and session state persist across calls."
+    )]
+    pub async fn execute_in_pinned_session(
+        &self,
+        Parameters(input): Parameters<ExecuteInPinnedSessionInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        debug!(
+            "Executing in pinned session {}: {}",
+            input.session_id,
+            truncate_for_log(&input.query, 100)
+        );
+
+        // Validate the query
+        if let Err(e) = self.validate_query(&input.query) {
+            return Ok(tool_error(format!("Query validation failed: {}", e)));
+        }
+
+        // Execute using SessionManager
+        let result = match self
+            .session_manager
+            .execute_in_session(&input.session_id, &input.query)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Session query failed: {}", e);
+                return Ok(tool_error(format!("Query execution failed: {}", e)));
+            }
+        };
+
+        // Format output based on requested format
+        let output = match input.format {
+            OutputFormat::Json => serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|e| format!("Failed to serialize result: {}", e)),
+            OutputFormat::Csv => result.to_csv(),
+            OutputFormat::Table => result.to_markdown_table(),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// End a pinned session and release its connection.
+    #[tool(
+        name = "end_pinned_session",
+        description = "End a pinned session and release its dedicated connection. Any temp tables will be automatically dropped."
+    )]
+    pub async fn end_pinned_session(
+        &self,
+        Parameters(input): Parameters<EndPinnedSessionInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        debug!("Ending pinned session: {}", input.session_id);
+
+        let session_info = match self
+            .session_manager
+            .end_session(&input.session_id)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                return Ok(tool_error(format!("Failed to end session: {}", e)));
+            }
+        };
+
+        info!("Pinned session {} ended after {} queries", input.session_id, session_info.query_count);
+
+        let response = json!({
+            "session_id": input.session_id,
+            "status": "ended",
+            "queries_executed": session_info.query_count,
+            "duration_ms": session_info.created_at.elapsed().as_millis(),
+            "message": "Session ended and connection released"
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| "Session ended".to_string()),
+        )]))
+    }
+
+    /// List all active pinned sessions.
+    #[tool(
+        name = "list_pinned_sessions",
+        description = "List all active pinned sessions with their statistics."
+    )]
+    pub async fn list_pinned_sessions(
+        &self,
+        Parameters(input): Parameters<ListPinnedSessionsInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        debug!("Listing pinned sessions");
+
+        let sessions = self.session_manager.list_sessions().await;
+
+        let session_list: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|s| {
+                let mut info = json!({
+                    "session_id": s.id,
+                    "query_count": s.query_count,
+                    "age_ms": s.created_at.elapsed().as_millis(),
+                    "idle_ms": s.last_activity.elapsed().as_millis(),
+                });
+                if input.detailed {
+                    info["created_at_relative"] = json!(format!("{:?} ago", s.created_at.elapsed()));
+                    info["last_activity_relative"] = json!(format!("{:?} ago", s.last_activity.elapsed()));
+                }
+                info
+            })
+            .collect();
+
+        let response = json!({
+            "count": sessions.len(),
+            "sessions": session_list
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| format!("{} sessions", sessions.len())),
+        )]))
     }
 
     // =========================================================================
