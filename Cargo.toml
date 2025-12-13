@@ -37,6 +37,7 @@ tiberius = { version = "0.12", default-features = false, features = [
     "tds73",
     "chrono",
     "rust_decimal",
+    "rustls",
 ] }
 
 # Connection pooling
