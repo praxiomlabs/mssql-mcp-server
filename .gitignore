@@ -1,1 +1,28 @@
+# Build artifacts
 /target
+
+# Environment files (contain credentials)
+.env
+.env.*
+!.env.example
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Profiling/Coverage
+*.pdb
+*.profraw
+*.profdata
+tarpaulin-report.html
+coverage/
+
+# Logs
+*.log
