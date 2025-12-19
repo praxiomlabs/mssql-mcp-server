@@ -48,7 +48,7 @@ Browse database metadata via MCP resources:
 
 ### Prerequisites
 
-- Rust 1.75 or later (see `rust-version` in Cargo.toml)
+- Rust 1.85 or later (see `rust-version` in Cargo.toml)
 - SQL Server 2016 or later (including Azure SQL Database)
 
 ### Build from Source
@@ -389,7 +389,7 @@ This project uses [just](https://github.com/casey/just) as a command runner. Run
 
 ### Prerequisites
 
-- Rust 1.75+ (MSRV defined in Cargo.toml)
+- Rust 1.85+ (MSRV defined in Cargo.toml)
 - Docker (for integration tests and local development)
 - [just](https://github.com/casey/just) command runner
 

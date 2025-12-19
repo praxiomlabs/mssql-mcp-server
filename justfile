@@ -8,8 +8,9 @@
 # Version from Cargo.toml (avoid drift)
 version := `cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version'`
 
-# Minimum Supported Rust Version
-msrv := "1.75"
+# Minimum Supported Rust Version (must match rust-version in Cargo.toml)
+# 1.85 required for rmcp dependency (uses Rust edition 2024)
+msrv := "1.85"
 
 # =============================================================================
 # Core Development Commands
