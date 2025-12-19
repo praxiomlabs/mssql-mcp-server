@@ -1,0 +1,115 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Targets to check
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# =============================================================================
+# Advisories - Security vulnerability and unmaintained crate checks
+# =============================================================================
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# How to handle unmaintained crates
+# "workspace" = only error on workspace crates, warn on transitive
+# "all" = error on all, "none" = ignore
+unmaintained = "workspace"
+
+# Ignore specific advisories with documented rationale
+ignore = [
+    # -------------------------------------------------------------------------
+    # Transitive dependencies from azure_core (via http-types -> futures-lite -> fastrand)
+    # These cannot be updated directly - waiting for upstream azure-sdk-for-rust updates
+    # -------------------------------------------------------------------------
+    { id = "RUSTSEC-2024-0384", reason = """
+        `instant` is unmaintained but has no security vulnerabilities.
+        Transitive dependency of azure_core via http-types.
+        Impact: None - timing utility, not security-sensitive.
+    """ },
+
+    { id = "RUSTSEC-2024-0436", reason = """
+        `paste` is unmaintained but has no security vulnerabilities.
+        Transitive dependency of azure_core.
+        Impact: None - proc-macro crate with no runtime code.
+    """ },
+
+    # -------------------------------------------------------------------------
+    # Transitive dependency from tiberius
+    # -------------------------------------------------------------------------
+    { id = "RUSTSEC-2025-0134", reason = """
+        `rustls-pemfile` 1.x unmaintained, replaced by 2.x.
+        Transitive dependency of tiberius for TLS certificate loading.
+        Impact: Low - no known vulnerabilities, just unmaintained.
+    """ },
+
+    # -------------------------------------------------------------------------
+    # Dev-only dependencies (testcontainers)
+    # These do NOT affect production binary
+    # -------------------------------------------------------------------------
+    { id = "RUSTSEC-2025-0111", reason = """
+        `tokio-tar` has PAX extended header parsing issues.
+        DEV-ONLY dependency via testcontainers for integration tests.
+        Impact: None for production - only used in test infrastructure.
+        No fix available upstream.
+    """ },
+]
+
+# =============================================================================
+# Licenses - Ensure all dependencies use acceptable licenses
+# =============================================================================
+[licenses]
+# List of explicitly allowed licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+# Confidence threshold for license detection
+confidence-threshold = 0.8
+
+# =============================================================================
+# Bans - Prevent specific crates or duplicate versions
+# =============================================================================
+[bans]
+# Allow multiple versions of crates (common in Rust ecosystem)
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+# Specific crates to deny
+deny = []
+
+# Crates to allow even if they would be banned
+allow = []
+
+# Skip checking certain crates for duplicate versions
+skip = []
+
+# =============================================================================
+# Sources - Restrict where crates can be fetched from
+# =============================================================================
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Allow crates from crates.io (default registry)
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# Allow specific git repositories if needed (empty by default)
+allow-git = []

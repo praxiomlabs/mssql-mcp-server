@@ -1,0 +1,6 @@
+# Typos configuration
+# https://github.com/crate-ci/typos
+
+[default.extend-words]
+# SQL Server functions and keywords that look like typos but are valid
+IIF = "IIF"  # T-SQL conditional function (Immediate IF)
