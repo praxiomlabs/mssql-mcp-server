@@ -6,9 +6,9 @@
 //! - Bulkhead pattern (future)
 
 use crate::error::McpError;
+use parking_lot::RwLock;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -424,13 +424,13 @@ impl CircuitBreaker {
 
     /// Get the current state of the circuit breaker.
     pub fn state(&self) -> CircuitState {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         self.effective_state(&state)
     }
 
     /// Get statistics about the circuit breaker.
     pub fn stats(&self) -> CircuitBreakerStats {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         CircuitBreakerStats {
             state: self.effective_state(&state),
             total_calls: self.total_calls.load(Ordering::Relaxed),
@@ -477,7 +477,7 @@ impl CircuitBreaker {
 
     /// Check if a request should be allowed through.
     fn should_allow_request(&self) -> bool {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write();
         let effective = self.effective_state(&state);
 
         match effective {
@@ -515,7 +515,7 @@ impl CircuitBreaker {
     fn record_success(&self) {
         self.total_successes.fetch_add(1, Ordering::Relaxed);
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write();
         let effective = self.effective_state(&state);
 
         match effective {
@@ -551,7 +551,7 @@ impl CircuitBreaker {
     fn record_failure(&self) {
         self.total_failures.fetch_add(1, Ordering::Relaxed);
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write();
         let effective = self.effective_state(&state);
 
         match effective {
@@ -592,7 +592,7 @@ impl CircuitBreaker {
 
     /// Manually reset the circuit breaker to closed state.
     pub fn reset(&self) {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write();
         info!("Circuit breaker manually reset to closed state");
         state.state = CircuitState::Closed;
         state.failure_count = 0;
@@ -903,7 +903,7 @@ mod tests {
 
         // Manually manipulate state by recording failures
         {
-            let mut state = breaker.state.write().unwrap();
+            let mut state = breaker.state.write();
             state.state = CircuitState::Open;
             state.failure_count = 5;
         }
