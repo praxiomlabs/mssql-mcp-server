@@ -1,0 +1,92 @@
+# Docker Compose configuration for local development SQL Server instances.
+#
+# This file provides persistent SQL Server containers for development and manual testing.
+# For automated integration tests, use testcontainers (cargo test --test integration_tests).
+#
+# Usage:
+#   just db-up              # Start all containers
+#   just db-up-2025         # Start only SQL Server 2025
+#   just db-down            # Stop all containers
+#   just db-logs            # View container logs
+#
+# Or directly with docker compose:
+#   docker compose up -d
+#   docker compose down
+#
+# Note: The `version:` field is intentionally omitted (obsolete since Compose v1.27.0).
+# Note: Use `docker compose` (space) not `docker-compose` (hyphen) - Compose v1 is deprecated.
+
+services:
+  # SQL Server 2025 - Current GA release (primary target)
+  mssql-2025:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    container_name: mssql_2025
+    hostname: mssql-2025
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong@Passw0rd"
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-2025-data:/var/opt/mssql
+    healthcheck:
+      # SQL Server 2025 uses mssql-tools18, requires -C flag for encryption
+      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C -b || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # SQL Server 2022 - Previous major version (supported)
+  mssql-2022:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql_2022
+    hostname: mssql-2022
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong@Passw0rd"
+      MSSQL_PID: Developer
+    ports:
+      - "1434:1433"
+    volumes:
+      - mssql-2022-data:/var/opt/mssql
+    healthcheck:
+      # SQL Server 2022 CU14+ uses mssql-tools18, requires -C flag
+      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C -b || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # SQL Server 2019 - Legacy (extended support only, mainstream ended Feb 2025)
+  mssql-2019:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    container_name: mssql_2019
+    hostname: mssql-2019
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong@Passw0rd"
+      MSSQL_PID: Developer
+    ports:
+      - "1435:1433"
+    volumes:
+      - mssql-2019-data:/var/opt/mssql
+    healthcheck:
+      # SQL Server 2019 CU28+ uses mssql-tools18, fallback to mssql-tools for older images
+      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C -b 2>/dev/null || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -b || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  mssql-2025-data:
+    name: mssql_mcp_2025_data
+  mssql-2022-data:
+    name: mssql_mcp_2022_data
+  mssql-2019-data:
+    name: mssql_mcp_2019_data
