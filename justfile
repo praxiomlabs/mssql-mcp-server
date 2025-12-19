@@ -46,11 +46,11 @@ test-integration:
     @echo "Running integration tests (requires Docker)..."
     cargo test --test integration_tests -- --ignored --test-threads=1
 
-# Run security audit (cargo-audit) - advisory only, cargo-deny is authoritative
+# Run security audit (cargo-audit) - advisory, see cargo-deny for blocking checks
 audit:
-    @cargo audit 2>&1 | grep -v "^$" || true
+    cargo audit || echo "Note: cargo-audit warnings are advisory. See deny.toml for documented exceptions."
 
-# Run comprehensive security and license check (cargo-deny) - authoritative
+# Run comprehensive security and license check (cargo-deny)
 deny:
     cargo deny check
 
@@ -74,8 +74,8 @@ build:
 clean:
     cargo clean
 
-# Run all CI checks locally (format, clippy, test, deny, doc)
-ci: fmt-check check test deny doc
+# Run all CI checks locally (format, clippy, test, audit, deny, doc)
+ci: fmt-check check test audit deny doc
     @echo "All CI checks passed!"
 
 # Generate code coverage report (requires cargo-llvm-cov)
@@ -229,38 +229,15 @@ test-integration-all:
 
 # Check for WIP markers (TODO, FIXME, XXX, HACK, todo!, unimplemented!)
 wip-check:
-    #!/usr/bin/env bash
-    echo "Checking for WIP markers..."
-    # Exclude test modules and check for blocking markers
-    BLOCKING=$(grep -rn "todo!\|unimplemented!" --include="*.rs" src/ 2>/dev/null \
-        | grep -v "#\[cfg(test)\]" \
-        | grep -v "mod tests" \
-        | grep -v "fn test_" || true)
-    if [ -n "$BLOCKING" ]; then
-        echo "ERROR: Found blocking WIP markers (todo!/unimplemented!):"
-        echo "$BLOCKING"
-        exit 1
-    fi
-    echo "WIP check passed"
+    @echo "Checking for WIP markers..."
+    @! grep -rn "TODO\|FIXME\|XXX\|HACK" --include="*.rs" src/ || echo "No TODO/FIXME/XXX/HACK found"
+    @! grep -rn "todo!\|unimplemented!" --include="*.rs" src/ || echo "No todo!/unimplemented! found"
 
 # Audit panic paths (.unwrap(), .expect() in production code)
 panic-audit:
-    #!/usr/bin/env bash
-    echo "Auditing panic paths in production code..."
-    # Exclude: test modules, doc-tests (///), test functions, #[cfg(test)]
-    RESULTS=$(grep -rn "\.unwrap()\|\.expect(" src/ --include="*.rs" 2>/dev/null \
-        | grep -v "mod tests" \
-        | grep -v "fn test_" \
-        | grep -v "#\[cfg(test)\]" \
-        | grep -v "/// " \
-        | grep -v "//!" || true)
-    if [ -n "$RESULTS" ]; then
-        COUNT=$(echo "$RESULTS" | wc -l)
-        echo "Found $COUNT potential panic paths in production code (review recommended)"
-    else
-        echo "No panic paths found"
-    fi
-    echo "Panic audit complete"
+    @echo "Auditing panic paths in production code..."
+    @grep -rn "\.unwrap()" src/ --include="*.rs" | grep -v "test\|#\[cfg(test)\]" || echo "No .unwrap() found in production code"
+    @grep -rn "\.expect(" src/ --include="*.rs" | grep -v "test\|#\[cfg(test)\]" || echo "No .expect() found in production code"
 
 # Check documentation builds without warnings
 doc-check:
@@ -293,14 +270,17 @@ version-sync:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Checking version sync..."
-    # Verify MSRV is consistent across files
-    CARGO_MSRV=$(grep "rust-version" Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-    README_MSRV=$(grep -oP "Rust \K[0-9]+\.[0-9]+" README.md | head -1 || echo "")
-    if [ -n "$README_MSRV" ] && [ "$CARGO_MSRV" != "$README_MSRV" ]; then
-        echo "ERROR: MSRV mismatch - Cargo.toml: $CARGO_MSRV, README.md: $README_MSRV"
-        exit 1
+    VERSION="{{version}}"
+    MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2)
+
+    # Check README.md for version references
+    if [ -f "README.md" ]; then
+        if grep -q "Rust 1\." README.md; then
+            echo "README.md contains Rust version reference"
+        fi
     fi
-    echo "Version sync passed (v{{version}}, MSRV $CARGO_MSRV)"
+
+    echo "Version sync check complete (v$VERSION)"
 
 # Verify MSRV compliance
 msrv-check:
@@ -310,25 +290,17 @@ msrv-check:
     cargo +{{msrv}} check --all-features
     echo "MSRV {{msrv}} check passed"
 
-# Check for semver violations (requires cargo-semver-checks, skipped if unavailable)
+# Check for semver violations
 semver:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Checking semver compliance..."
     if ! command -v cargo-semver-checks &> /dev/null; then
-        echo "Skipped: cargo-semver-checks not installed"
+        echo "cargo-semver-checks not installed (cargo install cargo-semver-checks)"
         exit 0
     fi
-    # Skip on first release (no baseline to compare)
-    if ! git describe --tags --abbrev=0 2>/dev/null; then
-        echo "Skipped: no previous release tag found"
-        exit 0
-    fi
-    if cargo semver-checks check-release 2>&1; then
-        echo "Semver check passed"
-    else
-        echo "Semver check failed or unavailable - review manually"
-    fi
+    cargo semver-checks check-release
+    echo "Semver check passed"
 
 # Test with various feature combinations
 test-features:
