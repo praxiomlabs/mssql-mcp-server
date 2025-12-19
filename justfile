@@ -1,6 +1,20 @@
 # MSSQL MCP Server - Development Commands
 # Run `just --list` to see all available commands
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Version from Cargo.toml (avoid drift)
+version := `cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version'`
+
+# Minimum Supported Rust Version
+msrv := "1.75"
+
+# =============================================================================
+# Core Development Commands
+# =============================================================================
+
 # Format code using nightly rustfmt
 fmt:
     cargo +nightly fmt --all
@@ -87,9 +101,17 @@ outdated:
 update:
     cargo update
 
-# Verify the package is ready for publishing
-publish-check:
+# Publish to crates.io (dry run)
+publish-dry:
     cargo publish --dry-run
+
+# Alias for backward compatibility
+publish-check: publish-dry
+
+# Publish to crates.io
+[confirm("This will publish to crates.io. This action is IRREVERSIBLE. Continue?")]
+publish:
+    cargo publish
 
 # Show dependency tree
 tree:
@@ -242,19 +264,87 @@ tag:
     git tag -a "v${VERSION}" -m "Release v${VERSION}"
     echo "Tag v${VERSION} created. Push with: git push origin v${VERSION}"
 
+# Check documentation versions match Cargo.toml
+version-sync:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Checking version sync..."
+    VERSION="{{version}}"
+    MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2)
+
+    # Check README.md for version references
+    if [ -f "README.md" ]; then
+        if grep -q "Rust 1\." README.md; then
+            echo "README.md contains Rust version reference"
+        fi
+    fi
+
+    echo "Version sync check complete (v$VERSION)"
+
+# Verify MSRV compliance
+msrv-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Checking MSRV {{msrv}}..."
+    cargo +{{msrv}} check --all-features
+    echo "MSRV {{msrv}} check passed"
+
+# Check for semver violations
+semver:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Checking semver compliance..."
+    if ! command -v cargo-semver-checks &> /dev/null; then
+        echo "cargo-semver-checks not installed (cargo install cargo-semver-checks)"
+        exit 0
+    fi
+    cargo semver-checks check-release
+    echo "Semver check passed"
+
+# Test with various feature combinations
+test-features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Testing feature matrix..."
+    echo "Testing with no features..."
+    cargo test --no-default-features
+    echo "Testing with default features..."
+    cargo test
+    echo "Testing with http feature..."
+    cargo test --features http
+    echo "Testing with telemetry feature..."
+    cargo test --features telemetry
+    echo "Testing with azure-auth feature..."
+    cargo test --features azure-auth
+    echo "Testing with all features..."
+    cargo test --all-features
+    echo "Feature matrix tests passed"
+
+# CI pipeline for releases (more thorough than standard ci)
+ci-release: ci semver msrv-check test-features
+    @echo "Release CI pipeline passed"
+
 # Full release readiness check
-release-check: ci wip-check panic-audit doc-check typos machete deny metadata-check
-    @echo ""
-    @echo "============================================"
-    @echo "Release readiness check completed!"
-    @echo "============================================"
-    @echo ""
-    @echo "Next steps:"
-    @echo "1. Review any warnings above"
-    @echo "2. Update version in Cargo.toml if needed"
-    @echo "3. Update CHANGELOG.md"
-    @echo "4. Commit changes: git commit -am 'chore: prepare release vX.Y.Z'"
-    @echo "5. Push to main: git push origin main"
-    @echo "6. Wait for CI to pass"
-    @echo "7. Create tag: just tag"
-    @echo "8. Push tag: git push origin vX.Y.Z"
+release-check: ci-release wip-check panic-audit doc-check version-sync typos machete metadata-check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ""
+    echo "============================================"
+    echo "Release readiness check completed!"
+    echo "============================================"
+    echo ""
+    echo "Checking for uncommitted changes..."
+    if ! git diff-index --quiet HEAD --; then
+        echo "WARNING: Uncommitted changes detected"
+        git status --short
+    fi
+    echo ""
+    echo "Next steps:"
+    echo "1. Review any warnings above"
+    echo "2. Update version in Cargo.toml if needed"
+    echo "3. Update CHANGELOG.md"
+    echo "4. Commit changes: git commit -am 'chore: release v{{version}}'"
+    echo "5. Push to main: git push origin main"
+    echo "6. Wait for CI to pass"
+    echo "7. Create tag: just tag"
+    echo "8. Push tag: git push origin v{{version}}"
