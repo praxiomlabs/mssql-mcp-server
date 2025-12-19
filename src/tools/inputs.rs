@@ -138,7 +138,9 @@ pub struct ExecuteQueryInput {
 
     /// Maximum number of rows to return (optional, uses server default if not specified).
     #[serde(default)]
-    #[schemars(description = "Maximum number of rows to return (default: server configured limit)")]
+    #[schemars(
+        description = "Maximum number of rows to return (default: server configured limit)"
+    )]
     pub max_rows: Option<usize>,
 
     /// Query timeout in seconds (optional, uses server default if not specified).
@@ -148,7 +150,9 @@ pub struct ExecuteQueryInput {
 
     /// Output format for query results.
     #[serde(default)]
-    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    #[schemars(
+        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
+    )]
     pub format: OutputFormat,
 }
 
@@ -190,6 +194,14 @@ pub struct ExecuteAsyncInput {
     #[serde(default)]
     #[schemars(description = "Maximum number of rows to return")]
     pub max_rows: Option<usize>,
+
+    /// Optional per-query timeout in seconds.
+    /// Overrides the global timeout for this query only.
+    #[serde(default)]
+    #[schemars(
+        description = "Per-query timeout in seconds. Overrides the global timeout for this query."
+    )]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Input for the `get_session_status` tool.
@@ -239,7 +251,9 @@ fn default_plan_type() -> String {
 pub struct ListSessionsInput {
     /// Filter by status: "running", "completed", "failed", "cancelled", or "all".
     #[serde(default = "default_status_filter")]
-    #[schemars(description = "Filter by status: 'running', 'completed', 'failed', 'cancelled', or 'all' (default: all)")]
+    #[schemars(
+        description = "Filter by status: 'running', 'completed', 'failed', 'cancelled', or 'all' (default: all)"
+    )]
     pub status: String,
 }
 
@@ -282,7 +296,9 @@ pub struct GetSessionResultsInput {
 
     /// Output format for query results.
     #[serde(default)]
-    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    #[schemars(
+        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
+    )]
     pub format: OutputFormat,
 
     /// Maximum number of rows to return from the results.
@@ -304,17 +320,23 @@ pub struct ExecuteParameterizedInput {
 
     /// Parameters as key-value pairs (parameter name to value).
     #[serde(default)]
-    #[schemars(description = "Parameters as key-value pairs. Keys are parameter names (with or without @), values are the parameter values.")]
+    #[schemars(
+        description = "Parameters as key-value pairs. Keys are parameter names (with or without @), values are the parameter values."
+    )]
     pub parameters: HashMap<String, Value>,
 
     /// Maximum number of rows to return.
     #[serde(default)]
-    #[schemars(description = "Maximum number of rows to return (default: server configured limit)")]
+    #[schemars(
+        description = "Maximum number of rows to return (default: server configured limit)"
+    )]
     pub max_rows: Option<usize>,
 
     /// Output format for query results.
     #[serde(default)]
-    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    #[schemars(
+        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
+    )]
     pub format: OutputFormat,
 }
 
@@ -332,7 +354,9 @@ pub struct BeginTransactionInput {
 
     /// Isolation level for the transaction.
     #[serde(default = "default_isolation_level")]
-    #[schemars(description = "Transaction isolation level: 'read_uncommitted', 'read_committed', 'repeatable_read', 'serializable', 'snapshot' (default: read_committed)")]
+    #[schemars(
+        description = "Transaction isolation level: 'read_uncommitted', 'read_committed', 'repeatable_read', 'serializable', 'snapshot' (default: read_committed)"
+    )]
     pub isolation_level: String,
 }
 
@@ -357,7 +381,9 @@ pub struct RollbackTransactionInput {
 
     /// Optional savepoint name to rollback to.
     #[serde(default)]
-    #[schemars(description = "Optional savepoint name to rollback to (if not specified, rolls back entire transaction)")]
+    #[schemars(
+        description = "Optional savepoint name to rollback to (if not specified, rolls back entire transaction)"
+    )]
     pub savepoint: Option<String>,
 }
 
@@ -386,7 +412,9 @@ pub struct ExecuteInTransactionInput {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecutePaginatedInput {
     /// The SQL query to paginate (must include ORDER BY clause).
-    #[schemars(description = "SQL query to paginate (must include ORDER BY clause for consistent ordering)")]
+    #[schemars(
+        description = "SQL query to paginate (must include ORDER BY clause for consistent ordering)"
+    )]
     pub query: String,
 
     /// Number of rows per page.
@@ -396,12 +424,16 @@ pub struct ExecutePaginatedInput {
 
     /// Page number (1-based) or cursor from previous result.
     #[serde(default)]
-    #[schemars(description = "Page number (1-based) for offset pagination, or cursor token from previous result")]
+    #[schemars(
+        description = "Page number (1-based) for offset pagination, or cursor token from previous result"
+    )]
     pub page: Option<PaginationPosition>,
 
     /// Output format for query results.
     #[serde(default)]
-    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    #[schemars(
+        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
+    )]
     pub format: OutputFormat,
 }
 
@@ -465,7 +497,9 @@ pub struct CompareSchemaInput {
 
     /// Types of objects to compare.
     #[serde(default = "default_object_types")]
-    #[schemars(description = "Object types to compare: 'tables', 'views', 'procedures', 'all' (default: all)")]
+    #[schemars(
+        description = "Object types to compare: 'tables', 'views', 'procedures', 'all' (default: all)"
+    )]
     pub object_types: String,
 }
 
@@ -513,7 +547,9 @@ pub struct SampleDataInput {
 
     /// Sampling method.
     #[serde(default = "default_sampling_method")]
-    #[schemars(description = "Sampling method: 'random', 'top', 'bottom', 'stratified' (default: random)")]
+    #[schemars(
+        description = "Sampling method: 'random', 'top', 'bottom', 'stratified' (default: random)"
+    )]
     pub method: String,
 
     /// Column to stratify by (for stratified sampling).
@@ -523,12 +559,16 @@ pub struct SampleDataInput {
 
     /// Optional WHERE clause filter.
     #[serde(default)]
-    #[schemars(description = "Optional WHERE clause to filter rows before sampling (without 'WHERE' keyword)")]
+    #[schemars(
+        description = "Optional WHERE clause to filter rows before sampling (without 'WHERE' keyword)"
+    )]
     pub filter: Option<String>,
 
     /// Output format for sample results.
     #[serde(default)]
-    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    #[schemars(
+        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
+    )]
     pub format: OutputFormat,
 }
 
@@ -556,7 +596,9 @@ pub struct BulkInsertInput {
     pub columns: Vec<String>,
 
     /// Rows of data to insert (array of arrays).
-    #[schemars(description = "Array of rows, where each row is an array of values matching the columns")]
+    #[schemars(
+        description = "Array of rows, where each row is an array of values matching the columns"
+    )]
     pub rows: Vec<Vec<Value>>,
 
     /// Batch size for chunked inserts.
@@ -601,7 +643,9 @@ pub struct ExportDataInput {
 pub struct GetMetricsInput {
     /// Categories of metrics to retrieve.
     #[serde(default = "default_metrics_categories")]
-    #[schemars(description = "Metric categories: 'connections', 'queries', 'performance', 'memory', 'all' (default: all)")]
+    #[schemars(
+        description = "Metric categories: 'connections', 'queries', 'performance', 'memory', 'all' (default: all)"
+    )]
     pub categories: String,
 
     /// Time range for query statistics (in minutes).
@@ -658,7 +702,9 @@ pub struct GetCacheStatsInput {
 pub struct ClearCacheInput {
     /// Optional pattern to match entries to clear.
     #[serde(default)]
-    #[schemars(description = "Optional pattern to match entries to clear (clears all if not specified)")]
+    #[schemars(
+        description = "Optional pattern to match entries to clear (clears all if not specified)"
+    )]
     pub pattern: Option<String>,
 }
 
@@ -671,7 +717,9 @@ pub struct ExecuteCachedInput {
 
     /// Maximum number of rows to return.
     #[serde(default)]
-    #[schemars(description = "Maximum number of rows to return (default: server configured limit)")]
+    #[schemars(
+        description = "Maximum number of rows to return (default: server configured limit)"
+    )]
     pub max_rows: Option<usize>,
 
     /// Custom TTL in seconds for this query's cache entry.
@@ -681,12 +729,16 @@ pub struct ExecuteCachedInput {
 
     /// Force refresh the cache (bypass existing cached result).
     #[serde(default)]
-    #[schemars(description = "Force refresh the cache, ignoring existing cached result (default: false)")]
+    #[schemars(
+        description = "Force refresh the cache, ignoring existing cached result (default: false)"
+    )]
     pub force_refresh: bool,
 
     /// Output format for query results.
     #[serde(default)]
-    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    #[schemars(
+        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
+    )]
     pub format: OutputFormat,
 }
 
@@ -742,7 +794,9 @@ pub struct ExecuteInPinnedSessionInput {
 
     /// Output format for query results.
     #[serde(default)]
-    #[schemars(description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)")]
+    #[schemars(
+        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
+    )]
     pub format: OutputFormat,
 }
 

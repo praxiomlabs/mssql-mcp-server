@@ -36,14 +36,27 @@ pub enum TransportType {
     Http,
 }
 
-impl TransportType {
-    /// Parse transport type from string.
-    pub fn from_str(s: &str) -> Option<Self> {
+/// Error returned when parsing a transport type fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseTransportTypeError(String);
+
+impl std::fmt::Display for ParseTransportTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid transport type: '{}'", self.0)
+    }
+}
+
+impl std::error::Error for ParseTransportTypeError {}
+
+impl std::str::FromStr for TransportType {
+    type Err = ParseTransportTypeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "stdio" | "standard" | "io" => Some(TransportType::Stdio),
+            "stdio" | "standard" | "io" => Ok(TransportType::Stdio),
             #[cfg(feature = "http")]
-            "http" | "sse" | "web" => Some(TransportType::Http),
-            _ => None,
+            "http" | "sse" | "web" => Ok(TransportType::Http),
+            _ => Err(ParseTransportTypeError(s.to_string())),
         }
     }
 }
@@ -265,9 +278,9 @@ pub mod http_server {
 
         // Create a simple ping stream to keep connection alive
         let stream = stream::repeat_with(|| {
-            Ok(Event::default()
-                .event("ping")
-                .data(serde_json::json!({"timestamp": chrono::Utc::now().to_rfc3339()}).to_string()))
+            Ok(Event::default().event("ping").data(
+                serde_json::json!({"timestamp": chrono::Utc::now().to_rfc3339()}).to_string(),
+            ))
         });
 
         Sse::new(stream).keep_alive(
@@ -278,35 +291,54 @@ pub mod http_server {
     }
 
     /// Message handler for JSON-RPC requests.
+    ///
+    /// This handler provides basic MCP protocol support over HTTP.
+    /// Note: Full MCP functionality is best used via stdio transport.
+    /// The HTTP transport provides a simplified interface for web integrations.
     async fn message_handler(
-        State(_state): State<Arc<HttpServerState>>,
+        State(state): State<Arc<HttpServerState>>,
         Json(request): Json<serde_json::Value>,
     ) -> impl IntoResponse {
-        info!("Received message: {:?}", request);
+        use rmcp::handler::server::ServerHandler;
 
-        // Basic JSON-RPC handling
+        info!("Received HTTP message: {:?}", request.get("method"));
+
         let method = request.get("method").and_then(|m| m.as_str());
         let id = request.get("id").cloned();
+        let _params = request.get("params").cloned();
 
         let response = match method {
             Some("initialize") => {
+                let server = state.mcp_server.read().await;
+                let info = server.get_info();
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "protocolVersion": "2025-03-26",
+                        "protocolVersion": "2024-11-05",
                         "serverInfo": {
-                            "name": "mssql-mcp-server",
-                            "version": env!("CARGO_PKG_VERSION"),
+                            "name": info.server_info.name,
+                            "version": info.server_info.version,
                         },
                         "capabilities": {
                             "tools": {},
                             "resources": {},
                             "prompts": {},
-                        }
+                        },
+                        "instructions": info.instructions
                     }
                 })
             }
+
+            Some("initialized") | Some("notifications/initialized") => {
+                // Client acknowledging initialization
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {}
+                })
+            }
+
             Some("ping") => {
                 serde_json::json!({
                     "jsonrpc": "2.0",
@@ -314,27 +346,37 @@ pub mod http_server {
                     "result": {}
                 })
             }
-            Some(_) => {
-                // Forward to MCP server - simplified for now
+
+            // Note: Full MCP method routing would require rmcp's internal context handling.
+            // For production HTTP transport, consider using the stdio transport via a subprocess
+            // or implementing a full JSON-RPC router that matches rmcp's expectations.
+            Some(method) => {
+                info!(
+                    "Method {} received - HTTP transport has limited support",
+                    method
+                );
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": {
                         "code": -32601,
-                        "message": "Method not implemented for HTTP transport"
+                        "message": format!(
+                            "Method '{}' is not fully supported over HTTP transport. \
+                             For full MCP functionality, use the stdio transport.",
+                            method
+                        )
                     }
                 })
             }
-            None => {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32600,
-                        "message": "Invalid request: missing method"
-                    }
-                })
-            }
+
+            None => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid request: missing method"
+                }
+            }),
         };
 
         Json(response)

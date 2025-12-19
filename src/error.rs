@@ -57,6 +57,12 @@ pub enum McpError {
     #[error("Query timeout: operation exceeded {timeout_seconds} seconds")]
     Timeout { timeout_seconds: u64 },
 
+    /// Circuit breaker open
+    #[error(
+        "Circuit breaker open: service unavailable, retry after {retry_after_seconds} seconds"
+    )]
+    CircuitOpen { retry_after_seconds: u64 },
+
     /// Constraint violation
     #[error("Constraint violation: {0}")]
     ConstraintViolation(String),
@@ -149,11 +155,7 @@ impl McpError {
     }
 
     /// Create a query execution error with SQL error details.
-    pub fn query_error_with_code(
-        msg: impl Into<String>,
-        code: i32,
-        state: Option<String>,
-    ) -> Self {
+    pub fn query_error_with_code(msg: impl Into<String>, code: i32, state: Option<String>) -> Self {
         Self::QueryExecution {
             message: msg.into(),
             sql_error_code: Some(code),
@@ -165,6 +167,13 @@ impl McpError {
     pub fn timeout(seconds: u64) -> Self {
         Self::Timeout {
             timeout_seconds: seconds,
+        }
+    }
+
+    /// Create a circuit breaker open error.
+    pub fn circuit_open(retry_after_seconds: u64) -> Self {
+        Self::CircuitOpen {
+            retry_after_seconds,
         }
     }
 
@@ -193,6 +202,7 @@ impl McpError {
         match self {
             Self::Connection { .. } => true,
             Self::Timeout { .. } => true,
+            Self::CircuitOpen { .. } => true,
             Self::QueryExecution {
                 sql_error_code: Some(code),
                 ..
@@ -218,8 +228,9 @@ impl McpError {
             Self::InjectionDetected(_) => {
                 Some("Use parameterized queries instead of string concatenation")
             }
-            Self::Timeout { .. } => {
-                Some("Try a simpler query or increase the timeout limit")
+            Self::Timeout { .. } => Some("Try a simpler query or increase the timeout limit"),
+            Self::CircuitOpen { .. } => {
+                Some("Service is temporarily unavailable due to repeated failures. Wait and retry.")
             }
             Self::ConstraintViolation(_) => {
                 Some("Check the constraint definition and your data values")
@@ -334,6 +345,15 @@ impl From<McpError> for ErrorData {
                 format!("Query timeout after {} seconds", timeout_seconds),
                 None,
             ),
+            McpError::CircuitOpen {
+                retry_after_seconds,
+            } => ErrorData::internal_error(
+                format!(
+                    "Service unavailable, circuit breaker open. Retry after {} seconds",
+                    retry_after_seconds
+                ),
+                None,
+            ),
             McpError::ConstraintViolation(msg) | McpError::DataTruncation(msg) => {
                 ErrorData::internal_error(msg, None)
             }
@@ -347,7 +367,7 @@ impl From<tiberius::error::Error> for McpError {
 
         match &e {
             Error::Server(server_error) => {
-                from_sql_error(server_error.code() as i32, &server_error.message())
+                from_sql_error(server_error.code() as i32, server_error.message())
             }
             Error::Io { kind, message } => {
                 McpError::connection(format!("IO error ({:?}): {}", kind, message))

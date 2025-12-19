@@ -10,7 +10,9 @@
 //! - Cache cleanup
 
 use anyhow::Result;
-use mssql_mcp_server::shutdown::{install_signal_handlers, new_shutdown_controller_with_timeouts, ShutdownConfig};
+use mssql_mcp_server::shutdown::{
+    install_signal_handlers, new_shutdown_controller_with_timeouts, ShutdownConfig,
+};
 use mssql_mcp_server::{Config, MssqlMcpServer};
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;

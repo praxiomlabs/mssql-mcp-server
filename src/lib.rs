@@ -22,6 +22,7 @@ pub mod database;
 pub mod error;
 pub mod handlers;
 pub mod prompts;
+pub mod resilience;
 pub mod resources;
 pub mod security;
 pub mod server;

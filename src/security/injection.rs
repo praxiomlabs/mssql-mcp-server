@@ -24,27 +24,56 @@ static INJECTION_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (compile(r"--\s*$"), "SQL line comment at end of input"),
         (compile(r"/\*.*\*/"), "SQL block comment"),
         // Union-based injection
-        (compile(r"(?i)\bUNION\s+(ALL\s+)?SELECT\b"), "UNION SELECT injection"),
+        (
+            compile(r"(?i)\bUNION\s+(ALL\s+)?SELECT\b"),
+            "UNION SELECT injection",
+        ),
         // OR-based injection (tautology)
-        (compile(r"(?i)'\s*OR\s+'[^']*'\s*=\s*'"), "OR tautology injection"),
-        (compile(r"(?i)'\s*OR\s+1\s*=\s*1"), "OR 1=1 injection (string context)"),
+        (
+            compile(r"(?i)'\s*OR\s+'[^']*'\s*=\s*'"),
+            "OR tautology injection",
+        ),
+        (
+            compile(r"(?i)'\s*OR\s+1\s*=\s*1"),
+            "OR 1=1 injection (string context)",
+        ),
         (compile(r"(?i)\bOR\s+1\s*=\s*1\b"), "OR 1=1 injection"),
         // AND-based injection
-        (compile(r"(?i)'\s*AND\s+'[^']*'\s*=\s*'"), "AND tautology injection"),
+        (
+            compile(r"(?i)'\s*AND\s+'[^']*'\s*=\s*'"),
+            "AND tautology injection",
+        ),
         // Stacked queries (multiple statements)
-        (compile(r";\s*(?i)(SELECT|INSERT|UPDATE|DELETE|DROP|EXEC|EXECUTE|CREATE|ALTER|TRUNCATE)\b"), "Stacked query injection"),
+        (
+            compile(
+                r";\s*(?i)(SELECT|INSERT|UPDATE|DELETE|DROP|EXEC|EXECUTE|CREATE|ALTER|TRUNCATE)\b",
+            ),
+            "Stacked query injection",
+        ),
         // Time-based blind injection
-        (compile(r"(?i)\bWAITFOR\s+DELAY\b"), "Time-based blind injection (WAITFOR)"),
+        (
+            compile(r"(?i)\bWAITFOR\s+DELAY\b"),
+            "Time-based blind injection (WAITFOR)",
+        ),
         // Extended stored procedures (common attack vectors)
-        (compile(r"(?i)\bxp_cmdshell\b"), "xp_cmdshell execution attempt"),
+        (
+            compile(r"(?i)\bxp_cmdshell\b"),
+            "xp_cmdshell execution attempt",
+        ),
         (compile(r"(?i)\bxp_reg\w+\b"), "Registry access attempt"),
         (compile(r"(?i)\bsp_oacreate\b"), "OLE automation attempt"),
         // Information disclosure
-        (compile(r"(?i)\bINFORMATION_SCHEMA\b.*\bWHERE\b.*="), "Schema enumeration with filter"),
+        (
+            compile(r"(?i)\bINFORMATION_SCHEMA\b.*\bWHERE\b.*="),
+            "Schema enumeration with filter",
+        ),
         // Hex-encoded injection
         (compile(r"0x[0-9a-fA-F]{10,}"), "Long hex-encoded string"),
         // CHAR() obfuscation
-        (compile(r"(?i)CHAR\s*\(\s*\d+\s*\)(\s*\+\s*CHAR\s*\(\s*\d+\s*\)){3,}"), "CHAR() obfuscation"),
+        (
+            compile(r"(?i)CHAR\s*\(\s*\d+\s*\)(\s*\+\s*CHAR\s*\(\s*\d+\s*\)){3,}"),
+            "CHAR() obfuscation",
+        ),
     ]
 });
 
@@ -136,7 +165,9 @@ mod tests {
     #[test]
     fn test_or_injection() {
         let d = detector();
-        assert!(d.check("SELECT * FROM Users WHERE name = '' OR '1'='1'").is_err());
+        assert!(d
+            .check("SELECT * FROM Users WHERE name = '' OR '1'='1'")
+            .is_err());
         assert!(d.check("SELECT * FROM Users WHERE id = 1 OR 1=1").is_err());
     }
 
@@ -144,9 +175,7 @@ mod tests {
     fn test_stacked_queries() {
         let d = detector();
         assert!(d.check("SELECT * FROM Users; DROP TABLE Users").is_err());
-        assert!(d
-            .check("SELECT * FROM Users; DELETE FROM Users")
-            .is_err());
+        assert!(d.check("SELECT * FROM Users; DELETE FROM Users").is_err());
     }
 
     #[test]
@@ -159,7 +188,9 @@ mod tests {
     #[test]
     fn test_waitfor_injection() {
         let d = detector();
-        assert!(d.check("SELECT * FROM Users; WAITFOR DELAY '0:0:5'").is_err());
+        assert!(d
+            .check("SELECT * FROM Users; WAITFOR DELAY '0:0:5'")
+            .is_err());
     }
 
     #[test]

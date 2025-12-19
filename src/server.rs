@@ -1,7 +1,9 @@
 //! MCP server struct definition and initialization.
 
 use crate::config::Config;
-use crate::database::{create_pool, ConnectionPool, MetadataQueries, QueryExecutor, SessionManager, TransactionManager};
+use crate::database::{
+    create_pool, ConnectionPool, MetadataQueries, QueryExecutor, SessionManager, TransactionManager,
+};
 use crate::error::McpError;
 use crate::security::QueryValidator;
 use crate::state::{new_shared_state, SharedState};
@@ -194,7 +196,9 @@ impl MssqlMcpServer {
         // ValidationResult.valid should be true if no error was returned
         if !result.valid {
             return Err(McpError::validation(
-                result.message.unwrap_or_else(|| "Query validation failed".to_string()),
+                result
+                    .message
+                    .unwrap_or_else(|| "Query validation failed".to_string()),
             ));
         }
 

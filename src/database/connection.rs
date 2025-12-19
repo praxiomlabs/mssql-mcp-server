@@ -1,14 +1,17 @@
 //! Connection pool management for SQL Server.
 
+use super::auth::{configure_auth, create_base_config};
 use crate::config::{AuthConfig, DatabaseConfig};
 use crate::error::McpError;
 use bb8::{Pool, PooledConnection};
 use std::future::Future;
 use std::sync::Arc;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
+use std::time::Duration;
+use tiberius::{Client, Config};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Type alias for the connection pool.
 pub type ConnectionPool = Pool<ConnectionManager>;
@@ -19,59 +22,25 @@ pub type PooledConn<'a> = PooledConnection<'a, ConnectionManager>;
 /// Connection manager for bb8 pool.
 #[derive(Clone)]
 pub struct ConnectionManager {
-    config: Arc<Config>,
+    /// Base configuration (without auth - auth is configured per connection for Azure AD)
+    base_config: Arc<Config>,
+    /// Auth configuration for token refresh
+    auth_config: Arc<AuthConfig>,
     host: String,
     port: u16,
 }
 
 impl ConnectionManager {
     /// Create a new connection manager from database configuration.
+    ///
+    /// Note: For Azure AD authentication, the token is acquired fresh for each
+    /// new connection to handle token expiration properly.
     pub fn new(db_config: &DatabaseConfig) -> Result<Self, McpError> {
-        let mut config = Config::new();
-
-        // Set host and port
-        config.host(&db_config.host);
-        config.port(db_config.port);
-
-        // Set database if specified
-        if let Some(ref database) = db_config.database {
-            config.database(database);
-        }
-
-        // Configure authentication
-        match &db_config.auth {
-            AuthConfig::SqlServer { username, password } => {
-                config.authentication(AuthMethod::sql_server(username, password));
-            }
-            #[cfg(windows)]
-            AuthConfig::Windows => {
-                config.authentication(AuthMethod::Integrated);
-            }
-            AuthConfig::AzureAd { .. } => {
-                // Azure AD auth requires additional setup
-                return Err(McpError::config(
-                    "Azure AD authentication is not yet supported",
-                ));
-            }
-        }
-
-        // Configure encryption
-        if db_config.encrypt {
-            config.encryption(EncryptionLevel::Required);
-        } else {
-            config.encryption(EncryptionLevel::Off);
-        }
-
-        // Trust server certificate if requested
-        if db_config.trust_server_certificate {
-            config.trust_cert();
-        }
-
-        // Set application name
-        config.application_name(&db_config.application_name);
+        let base_config = create_base_config(db_config);
 
         Ok(Self {
-            config: Arc::new(config),
+            base_config: Arc::new(base_config),
+            auth_config: Arc::new(db_config.auth.clone()),
             host: db_config.host.clone(),
             port: db_config.port,
         })
@@ -88,29 +57,60 @@ impl bb8::ManageConnection for ConnectionManager {
     type Error = tiberius::error::Error;
 
     fn connect(&self) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        let config = self.config.clone();
+        let base_config = self.base_config.clone();
+        let auth_config = self.auth_config.clone();
         let address = self.address();
 
         async move {
             debug!("Creating new database connection to {}", address);
 
+            // Configure authentication (acquires fresh Azure AD token if needed)
+            let config = configure_auth(&base_config, &auth_config)
+                .await
+                .map_err(|e| {
+                    // Convert McpError to tiberius error for bb8 compatibility
+                    tiberius::error::Error::Protocol(e.to_string().into())
+                })?;
+
             let tcp = TcpStream::connect(&address).await?;
             tcp.set_nodelay(true)?;
 
-            let client = Client::connect((*config).clone(), tcp.compat_write()).await?;
+            let client = Client::connect(config, tcp.compat_write()).await?;
 
             debug!("Database connection established");
             Ok(client)
         }
     }
 
-    fn is_valid(&self, conn: &mut Self::Connection) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        // We need to take a mutable reference and return a future
-        // Since we can't move conn into the async block, use a simple approach
+    fn is_valid(
+        &self,
+        conn: &mut Self::Connection,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // Validate connection with a lightweight query
+        // Use a 5 second timeout to prevent hanging on dead connections
+        const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
+
         let query_future = conn.simple_query("SELECT 1");
         async move {
-            query_future.await?;
-            Ok(())
+            match timeout(VALIDATION_TIMEOUT, async {
+                // Execute validation query and consume results
+                let stream = query_future.await?;
+                let _ = stream.into_results().await?;
+                Ok::<_, tiberius::error::Error>(())
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        "Connection validation timed out after {:?}",
+                        VALIDATION_TIMEOUT
+                    );
+                    Err(tiberius::error::Error::Protocol(
+                        "Connection validation timeout".into(),
+                    ))
+                }
+            }
         }
     }
 
@@ -142,10 +142,9 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<ConnectionPool, McpE
 
     // Test the pool by getting a connection
     {
-        let _conn = pool
-            .get()
-            .await
-            .map_err(|e| McpError::connection(format!("Failed to establish initial connection: {}", e)))?;
+        let _conn = pool.get().await.map_err(|e| {
+            McpError::connection(format!("Failed to establish initial connection: {}", e))
+        })?;
         // Connection dropped here, releasing borrow
     }
 

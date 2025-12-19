@@ -37,19 +37,14 @@ pub struct SessionState {
 }
 
 /// Transaction isolation level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IsolationLevel {
     ReadUncommitted,
+    #[default]
     ReadCommitted,
     RepeatableRead,
     Serializable,
     Snapshot,
-}
-
-impl Default for IsolationLevel {
-    fn default() -> Self {
-        IsolationLevel::ReadCommitted
-    }
 }
 
 impl std::fmt::Display for IsolationLevel {
@@ -64,16 +59,29 @@ impl std::fmt::Display for IsolationLevel {
     }
 }
 
-impl IsolationLevel {
-    /// Parse isolation level from string.
-    pub fn from_str(s: &str) -> Option<Self> {
+/// Error returned when parsing an isolation level fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseIsolationLevelError(String);
+
+impl std::fmt::Display for ParseIsolationLevelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid isolation level: '{}'", self.0)
+    }
+}
+
+impl std::error::Error for ParseIsolationLevelError {}
+
+impl std::str::FromStr for IsolationLevel {
+    type Err = ParseIsolationLevelError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().replace(['-', '_'], " ").trim() {
-            "read uncommitted" => Some(IsolationLevel::ReadUncommitted),
-            "read committed" => Some(IsolationLevel::ReadCommitted),
-            "repeatable read" => Some(IsolationLevel::RepeatableRead),
-            "serializable" => Some(IsolationLevel::Serializable),
-            "snapshot" => Some(IsolationLevel::Snapshot),
-            _ => None,
+            "read uncommitted" => Ok(IsolationLevel::ReadUncommitted),
+            "read committed" => Ok(IsolationLevel::ReadCommitted),
+            "repeatable read" => Ok(IsolationLevel::RepeatableRead),
+            "serializable" => Ok(IsolationLevel::Serializable),
+            "snapshot" => Ok(IsolationLevel::Snapshot),
+            _ => Err(ParseIsolationLevelError(s.to_string())),
         }
     }
 }
@@ -367,7 +375,11 @@ impl SessionState {
     }
 
     /// Create a new session and return its ID.
-    pub fn create_session(&mut self, query: String, max_sessions: usize) -> Result<String, McpError> {
+    pub fn create_session(
+        &mut self,
+        query: String,
+        max_sessions: usize,
+    ) -> Result<String, McpError> {
         // Check if we've hit the session limit
         let running_count = self.sessions.values().filter(|s| s.is_running()).count();
         if running_count >= max_sessions {
@@ -472,7 +484,10 @@ impl SessionState {
 
     /// List all transactions.
     pub fn list_transactions(&self) -> Vec<TransactionSummary> {
-        self.transactions.values().map(TransactionSummary::from).collect()
+        self.transactions
+            .values()
+            .map(TransactionSummary::from)
+            .collect()
     }
 
     /// List active transactions.
@@ -570,7 +585,10 @@ mod tests {
         assert_eq!(state.running_session_count(), 2);
 
         // Complete one session
-        state.get_session_mut(&id1).unwrap().complete(crate::database::QueryResult::empty());
+        state
+            .get_session_mut(&id1)
+            .unwrap()
+            .complete(crate::database::QueryResult::empty());
         assert_eq!(state.running_session_count(), 1);
 
         // List sessions
@@ -600,7 +618,8 @@ mod tests {
 
     #[test]
     fn test_transaction_lifecycle() {
-        let mut tx = TransactionState::new(Some("test_tx".to_string()), IsolationLevel::ReadCommitted);
+        let mut tx =
+            TransactionState::new(Some("test_tx".to_string()), IsolationLevel::ReadCommitted);
         assert!(tx.is_active());
         assert_eq!(tx.statement_count, 0);
 
@@ -620,8 +639,12 @@ mod tests {
         let mut state = SessionState::new();
 
         // Create transactions
-        let id1 = state.create_transaction(Some("tx1".to_string()), IsolationLevel::ReadCommitted, 10).unwrap();
-        let id2 = state.create_transaction(None, IsolationLevel::Serializable, 10).unwrap();
+        let id1 = state
+            .create_transaction(Some("tx1".to_string()), IsolationLevel::ReadCommitted, 10)
+            .unwrap();
+        let id2 = state
+            .create_transaction(None, IsolationLevel::Serializable, 10)
+            .unwrap();
 
         assert_eq!(state.total_transaction_count(), 2);
         assert_eq!(state.active_transaction_count(), 2);
@@ -645,7 +668,9 @@ mod tests {
 
         // Create max transactions
         for i in 0..3 {
-            state.create_transaction(Some(format!("tx{}", i)), IsolationLevel::ReadCommitted, 3).unwrap();
+            state
+                .create_transaction(Some(format!("tx{}", i)), IsolationLevel::ReadCommitted, 3)
+                .unwrap();
         }
 
         // Should fail to create another
@@ -655,12 +680,18 @@ mod tests {
 
     #[test]
     fn test_isolation_level_parsing() {
-        assert_eq!(IsolationLevel::from_str("read_uncommitted"), Some(IsolationLevel::ReadUncommitted));
-        assert_eq!(IsolationLevel::from_str("READ-COMMITTED"), Some(IsolationLevel::ReadCommitted));
-        assert_eq!(IsolationLevel::from_str("repeatable read"), Some(IsolationLevel::RepeatableRead));
-        assert_eq!(IsolationLevel::from_str("SERIALIZABLE"), Some(IsolationLevel::Serializable));
-        assert_eq!(IsolationLevel::from_str("snapshot"), Some(IsolationLevel::Snapshot));
-        assert_eq!(IsolationLevel::from_str("invalid"), None);
+        assert_eq!(
+            "read_uncommitted".parse(),
+            Ok(IsolationLevel::ReadUncommitted)
+        );
+        assert_eq!("READ-COMMITTED".parse(), Ok(IsolationLevel::ReadCommitted));
+        assert_eq!(
+            "repeatable read".parse(),
+            Ok(IsolationLevel::RepeatableRead)
+        );
+        assert_eq!("SERIALIZABLE".parse(), Ok(IsolationLevel::Serializable));
+        assert_eq!("snapshot".parse(), Ok(IsolationLevel::Snapshot));
+        assert!("invalid".parse::<IsolationLevel>().is_err());
     }
 
     #[test]

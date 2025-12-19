@@ -5,8 +5,9 @@ use crate::database::ConnectionPool;
 use crate::error::McpError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tiberius::QueryStream;
+use tokio::time::timeout;
 use tracing::debug;
 
 /// A single row of query results.
@@ -90,7 +91,10 @@ impl QueryResult {
     pub fn to_markdown_table(&self) -> String {
         if self.columns.is_empty() {
             if self.rows_affected > 0 {
-                return format!("Query executed successfully. {} row(s) affected.", self.rows_affected);
+                return format!(
+                    "Query executed successfully. {} row(s) affected.",
+                    self.rows_affected
+                );
             }
             return "Query executed successfully. No results returned.".to_string();
         }
@@ -202,17 +206,53 @@ impl QueryExecutor {
         query: &str,
         max_rows: usize,
     ) -> Result<QueryResult, McpError> {
+        self.execute_with_options(query, max_rows, None).await
+    }
+
+    /// Execute a query with a specific timeout (in seconds).
+    pub async fn execute_with_timeout(
+        &self,
+        query: &str,
+        timeout_seconds: u64,
+    ) -> Result<QueryResult, McpError> {
+        self.execute_with_options(query, self.max_rows, Some(timeout_seconds))
+            .await
+    }
+
+    /// Execute a query with configurable row limit and timeout.
+    ///
+    /// This is the primary execution method that supports both row limits and timeouts.
+    /// Other execute methods delegate to this one.
+    pub async fn execute_with_options(
+        &self,
+        query: &str,
+        max_rows: usize,
+        timeout_seconds: Option<u64>,
+    ) -> Result<QueryResult, McpError> {
         let start = Instant::now();
 
-        debug!("Executing query: {}", truncate_for_log(query, 200));
+        debug!(
+            "Executing query (max_rows={}, timeout={:?}s): {}",
+            max_rows,
+            timeout_seconds,
+            truncate_for_log(query, 200)
+        );
 
-        let mut conn = self.pool.get().await?;
+        // Wrap execution in timeout if specified
+        let execution_future = async {
+            let mut conn = self.pool.get().await?;
+            let stream = conn.query(query, &[]).await?;
+            self.process_stream(stream, max_rows, start).await
+        };
 
-        // Execute query
-        let stream = conn.query(query, &[]).await?;
-
-        // Process results
-        let result = self.process_stream(stream, max_rows, start).await?;
+        let result = if let Some(secs) = timeout_seconds {
+            let duration = Duration::from_secs(secs);
+            timeout(duration, execution_future)
+                .await
+                .map_err(|_| McpError::timeout(secs))?
+        } else {
+            execution_future.await
+        }?;
 
         debug!(
             "Query completed: {} rows in {} ms",
@@ -360,7 +400,9 @@ impl QueryExecutor {
                 .map_err(|e| McpError::query_error(format!("Failed to get execution plan: {}", e)))?
                 .into_results()
                 .await
-                .map_err(|e| McpError::query_error(format!("Failed to get execution plan: {}", e)))?;
+                .map_err(|e| {
+                    McpError::query_error(format!("Failed to get execution plan: {}", e))
+                })?;
 
             // Turn off SHOWPLAN (best effort - if this fails, the connection will be invalid
             // but bb8 will handle that on next use)
@@ -385,10 +427,9 @@ impl QueryExecutor {
             // For actual execution plans, we can use STATISTICS which don't have
             // the same batch restriction
             let full_query = format!("{}\n{}\n{}", set_on, query, set_off);
-            let stream = conn
-                .query(&full_query, &[])
-                .await
-                .map_err(|e| McpError::query_error(format!("Failed to execute with statistics: {}", e)))?;
+            let stream = conn.query(&full_query, &[]).await.map_err(|e| {
+                McpError::query_error(format!("Failed to execute with statistics: {}", e))
+            })?;
 
             let result = self.process_stream(stream, self.max_rows, start).await?;
 
@@ -518,7 +559,10 @@ impl QueryExecutor {
         let start = Instant::now();
         let batches = split_on_go(script);
 
-        debug!("Executing multi-batch query with {} batch(es)", batches.len());
+        debug!(
+            "Executing multi-batch query with {} batch(es)",
+            batches.len()
+        );
 
         let mut combined_columns: Vec<ColumnInfo> = Vec::new();
         let mut combined_rows: Vec<ResultRow> = Vec::new();
@@ -533,7 +577,11 @@ impl QueryExecutor {
             }
 
             batch_num += 1;
-            debug!("Executing batch {}: {}", batch_num, truncate_for_log(trimmed, 100));
+            debug!(
+                "Executing batch {}: {}",
+                batch_num,
+                truncate_for_log(trimmed, 100)
+            );
 
             // Use simple_query for each batch so DDL works correctly
             let results = conn
@@ -807,6 +855,9 @@ mod tests {
     #[test]
     fn test_truncate_for_log() {
         assert_eq!(truncate_for_log("short", 10), "short");
-        assert_eq!(truncate_for_log("this is a long string", 10), "this is a ...");
+        assert_eq!(
+            truncate_for_log("this is a long string", 10),
+            "this is a ..."
+        );
     }
 }

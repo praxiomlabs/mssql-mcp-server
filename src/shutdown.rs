@@ -276,7 +276,10 @@ pub fn new_shutdown_controller_with_timeouts(
     drain_timeout: Duration,
     force_timeout: Duration,
 ) -> SharedShutdownController {
-    Arc::new(ShutdownController::with_timeouts(drain_timeout, force_timeout))
+    Arc::new(ShutdownController::with_timeouts(
+        drain_timeout,
+        force_timeout,
+    ))
 }
 
 /// Install signal handlers for graceful shutdown.

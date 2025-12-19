@@ -171,29 +171,62 @@ impl Config {
         let host = std::env::var("MSSQL_HOST")
             .map_err(|_| McpError::config("MSSQL_HOST environment variable is required"))?;
 
-        // Required for SQL auth: Username and Password
-        let username = std::env::var("MSSQL_USER").ok();
-        let password = std::env::var("MSSQL_PASSWORD").ok();
+        // Determine authentication type
+        let auth_type = std::env::var("MSSQL_AUTH_TYPE")
+            .ok()
+            .map(|s| s.to_lowercase());
 
-        let auth = match (username, password) {
-            (Some(u), Some(p)) => AuthConfig::SqlServer {
-                username: u,
-                password: p,
-            },
-            (Some(_), None) => {
-                return Err(McpError::config(
-                    "MSSQL_PASSWORD is required when MSSQL_USER is set",
-                ))
+        let auth = match auth_type.as_deref() {
+            Some("azuread") | Some("azure") | Some("aad") => {
+                // Azure AD Authentication
+                let client_id = std::env::var("MSSQL_AZURE_CLIENT_ID").map_err(|_| {
+                    McpError::config(
+                        "MSSQL_AZURE_CLIENT_ID is required for Azure AD authentication",
+                    )
+                })?;
+                let client_secret = std::env::var("MSSQL_AZURE_CLIENT_SECRET").map_err(|_| {
+                    McpError::config(
+                        "MSSQL_AZURE_CLIENT_SECRET is required for Azure AD authentication",
+                    )
+                })?;
+                let tenant_id = std::env::var("MSSQL_AZURE_TENANT_ID").map_err(|_| {
+                    McpError::config(
+                        "MSSQL_AZURE_TENANT_ID is required for Azure AD authentication",
+                    )
+                })?;
+
+                AuthConfig::AzureAd {
+                    client_id,
+                    client_secret,
+                    tenant_id,
+                }
             }
-            (None, Some(_)) => {
-                return Err(McpError::config(
-                    "MSSQL_USER is required when MSSQL_PASSWORD is set",
-                ))
-            }
-            (None, None) => {
-                return Err(McpError::config(
-                    "Authentication required: set MSSQL_USER and MSSQL_PASSWORD",
-                ))
+            _ => {
+                // SQL Server Authentication (default)
+                let username = std::env::var("MSSQL_USER").ok();
+                let password = std::env::var("MSSQL_PASSWORD").ok();
+
+                match (username, password) {
+                    (Some(u), Some(p)) => AuthConfig::SqlServer {
+                        username: u,
+                        password: p,
+                    },
+                    (Some(_), None) => {
+                        return Err(McpError::config(
+                            "MSSQL_PASSWORD is required when MSSQL_USER is set",
+                        ))
+                    }
+                    (None, Some(_)) => {
+                        return Err(McpError::config(
+                            "MSSQL_USER is required when MSSQL_PASSWORD is set",
+                        ))
+                    }
+                    (None, None) => {
+                        return Err(McpError::config(
+                            "Authentication required: set MSSQL_USER and MSSQL_PASSWORD, or use MSSQL_AUTH_TYPE=azuread",
+                        ))
+                    }
+                }
             }
         };
 
@@ -231,6 +264,11 @@ impl Config {
             .and_then(|p| p.parse().ok())
             .unwrap_or(DEFAULT_CONNECTION_TIMEOUT_SECS);
 
+        let idle_timeout_secs: u64 = std::env::var("MSSQL_IDLE_TIMEOUT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(300);
+
         // Optional: Query settings
         let default_timeout_secs = std::env::var("MSSQL_QUERY_TIMEOUT")
             .ok()
@@ -262,6 +300,10 @@ impl Config {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(DEFAULT_MAX_RESULT_ROWS);
+
+        let injection_detection = std::env::var("MSSQL_INJECTION_DETECTION")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
 
         // Optional: Session settings
         let max_sessions = std::env::var("MSSQL_MAX_SESSIONS")
@@ -299,7 +341,7 @@ impl Config {
                     min_connections,
                     max_connections,
                     connection_timeout: Duration::from_secs(connection_timeout_secs),
-                    idle_timeout: Duration::from_secs(300),
+                    idle_timeout: Duration::from_secs(idle_timeout_secs),
                 },
                 encrypt,
                 trust_server_certificate,
@@ -307,7 +349,7 @@ impl Config {
             },
             security: SecurityConfig {
                 validation_mode,
-                injection_detection: true,
+                injection_detection,
                 max_query_length,
                 max_result_rows,
             },

@@ -9,8 +9,8 @@ use crate::server::MssqlMcpServer;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     GetPromptRequestParam, GetPromptResult, Implementation, ListPromptsResult,
-    ListResourceTemplatesResult, ListResourcesResult, Meta, PaginatedRequestParam,
-    ProtocolVersion, ReadResourceRequestParam, ReadResourceResult, ServerCapabilities, ServerInfo,
+    ListResourceTemplatesResult, ListResourcesResult, Meta, PaginatedRequestParam, ProtocolVersion,
+    ReadResourceRequestParam, ReadResourceResult, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool_handler, ErrorData};
@@ -120,11 +120,11 @@ impl ServerHandler for MssqlMcpServer {
         let arguments: Option<std::collections::HashMap<String, String>> =
             request.arguments.map(|map| {
                 map.into_iter()
-                    .filter_map(|(k, v)| {
+                    .map(|(k, v)| {
                         // Convert Value to String (handle strings and other types)
                         match v {
-                            serde_json::Value::String(s) => Some((k, s)),
-                            other => Some((k, other.to_string())),
+                            serde_json::Value::String(s) => (k, s),
+                            other => (k, other.to_string()),
                         }
                     })
                     .collect()
@@ -167,9 +167,7 @@ fn build_instructions(server: &MssqlMcpServer) -> String {
             instructions.push_str("- **Read-only mode**: Only SELECT queries are allowed\n");
         }
         crate::security::ValidationMode::Standard => {
-            instructions.push_str(
-                "- **Standard mode**: SELECT, INSERT, UPDATE, DELETE allowed\n",
-            );
+            instructions.push_str("- **Standard mode**: SELECT, INSERT, UPDATE, DELETE allowed\n");
             instructions.push_str("- DDL operations (CREATE, DROP, ALTER) are blocked\n");
         }
         crate::security::ValidationMode::Unrestricted => {

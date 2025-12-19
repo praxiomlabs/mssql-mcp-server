@@ -4,12 +4,95 @@
 //! - Metrics export (query counts, latency, errors)
 //! - Distributed tracing integration
 //! - Connection pool statistics
+//! - Correlation ID tracking for request tracing
 //!
 //! Requires the `telemetry` feature flag.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// Generate a new correlation ID for request tracing.
+///
+/// Correlation IDs are used to track requests across the system and
+/// can be included in logs for debugging and tracing purposes.
+pub fn generate_correlation_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Generate a short correlation ID (8 characters) for compact logging.
+pub fn generate_short_correlation_id() -> String {
+    Uuid::new_v4().to_string()[..8].to_string()
+}
+
+/// Request context for carrying correlation information through the request lifecycle.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    /// Unique identifier for this request.
+    pub correlation_id: String,
+    /// When the request was received.
+    pub start_time: Instant,
+    /// Client identifier (if available).
+    pub client_id: Option<String>,
+    /// Tool or resource being accessed.
+    pub operation: Option<String>,
+}
+
+impl RequestContext {
+    /// Create a new request context with a generated correlation ID.
+    pub fn new() -> Self {
+        Self {
+            correlation_id: generate_short_correlation_id(),
+            start_time: Instant::now(),
+            client_id: None,
+            operation: None,
+        }
+    }
+
+    /// Create a new request context with a specific correlation ID.
+    pub fn with_correlation_id(correlation_id: impl Into<String>) -> Self {
+        Self {
+            correlation_id: correlation_id.into(),
+            start_time: Instant::now(),
+            client_id: None,
+            operation: None,
+        }
+    }
+
+    /// Set the client identifier.
+    pub fn with_client(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = Some(client_id.into());
+        self
+    }
+
+    /// Set the operation name.
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(operation.into());
+        self
+    }
+
+    /// Get the elapsed time since the request started.
+    pub fn elapsed(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Create a log prefix for consistent logging format.
+    pub fn log_prefix(&self) -> String {
+        match (&self.client_id, &self.operation) {
+            (Some(client), Some(op)) => format!("[{}] [{}] [{}]", self.correlation_id, client, op),
+            (Some(client), None) => format!("[{}] [{}]", self.correlation_id, client),
+            (None, Some(op)) => format!("[{}] [{}]", self.correlation_id, op),
+            (None, None) => format!("[{}]", self.correlation_id),
+        }
+    }
+}
+
+impl Default for RequestContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Server metrics collection.
 ///
@@ -87,7 +170,8 @@ impl ServerMetrics {
 
     /// Record a transaction rollback.
     pub fn record_transaction_rollback(&self) {
-        self.transactions_rolled_back.fetch_add(1, Ordering::Relaxed);
+        self.transactions_rolled_back
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a cache hit.
@@ -480,5 +564,68 @@ mod tests {
 
         // Should return 0 avg time when no queries
         assert_eq!(metrics.avg_query_time_ms(), 0.0);
+    }
+
+    #[test]
+    fn test_correlation_id_generation() {
+        let id1 = generate_correlation_id();
+        let id2 = generate_correlation_id();
+
+        // IDs should be unique
+        assert_ne!(id1, id2);
+
+        // Full UUID format (36 chars with hyphens)
+        assert_eq!(id1.len(), 36);
+    }
+
+    #[test]
+    fn test_short_correlation_id() {
+        let short_id = generate_short_correlation_id();
+
+        // Short ID should be 8 characters
+        assert_eq!(short_id.len(), 8);
+    }
+
+    #[test]
+    fn test_request_context() {
+        let ctx = RequestContext::new();
+
+        // Should have a short correlation ID
+        assert_eq!(ctx.correlation_id.len(), 8);
+
+        // Should have no client or operation
+        assert!(ctx.client_id.is_none());
+        assert!(ctx.operation.is_none());
+    }
+
+    #[test]
+    fn test_request_context_with_details() {
+        let ctx = RequestContext::new()
+            .with_client("test-client")
+            .with_operation("execute_query");
+
+        assert!(ctx.client_id.is_some());
+        assert!(ctx.operation.is_some());
+        assert_eq!(ctx.client_id.unwrap(), "test-client");
+        assert_eq!(ctx.operation.unwrap(), "execute_query");
+    }
+
+    #[test]
+    fn test_request_context_log_prefix() {
+        let ctx = RequestContext::with_correlation_id("abc12345")
+            .with_client("client1")
+            .with_operation("query");
+
+        let prefix = ctx.log_prefix();
+        assert_eq!(prefix, "[abc12345] [client1] [query]");
+
+        let ctx_no_op = RequestContext::with_correlation_id("abc12345").with_client("client1");
+        assert_eq!(ctx_no_op.log_prefix(), "[abc12345] [client1]");
+
+        let ctx_no_client = RequestContext::with_correlation_id("abc12345").with_operation("query");
+        assert_eq!(ctx_no_client.log_prefix(), "[abc12345] [query]");
+
+        let ctx_minimal = RequestContext::with_correlation_id("abc12345");
+        assert_eq!(ctx_minimal.log_prefix(), "[abc12345]");
     }
 }

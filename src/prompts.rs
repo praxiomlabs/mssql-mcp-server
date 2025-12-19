@@ -5,8 +5,7 @@
 
 use crate::server::MssqlMcpServer;
 use rmcp::model::{
-    GetPromptResult, Prompt, PromptArgument, PromptMessage, PromptMessageContent,
-    PromptMessageRole,
+    GetPromptResult, Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole,
 };
 use std::collections::HashMap;
 
@@ -41,7 +40,11 @@ pub fn build_prompt_list() -> Vec<Prompt> {
             vec![
                 prompt_arg("schema", "Schema name (default: dbo)", false),
                 prompt_arg("table", "Table name to query", true),
-                prompt_arg("columns", "Comma-separated list of columns (default: all)", false),
+                prompt_arg(
+                    "columns",
+                    "Comma-separated list of columns (default: all)",
+                    false,
+                ),
                 prompt_arg("filter", "Natural language filter condition", false),
             ],
         ),
@@ -212,7 +215,9 @@ async fn get_analyze_schema_prompt(
                 "| {} | {} | {} | {} | {} | {} |",
                 c.column_name,
                 c.data_type,
-                c.max_length.map(|l| l.to_string()).unwrap_or("-".to_string()),
+                c.max_length
+                    .map(|l| l.to_string())
+                    .unwrap_or("-".to_string()),
                 if c.is_nullable { "Yes" } else { "No" },
                 if c.is_identity { "Yes" } else { "No" },
                 c.default_value.as_deref().unwrap_or("-")

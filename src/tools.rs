@@ -122,7 +122,12 @@ impl MssqlMcpServer {
             }
         } else {
             // Execute the query using standard parameterized method
-            match self.executor.execute_with_limit(&input.query, max_rows).await {
+            // Use execute_with_options to support per-query timeout overrides
+            match self
+                .executor
+                .execute_with_options(&input.query, max_rows, input.timeout_seconds)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Query execution failed: {}", e);
@@ -133,11 +138,10 @@ impl MssqlMcpServer {
 
         // Format output based on requested format
         let output = match input.format {
-            OutputFormat::Json => serde_json::to_string_pretty(&result)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to serialize query result to JSON: {}", e);
-                    format!("Failed to serialize result: {}", e)
-                }),
+            OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                warn!("Failed to serialize query result to JSON: {}", e);
+                format!("Failed to serialize result: {}", e)
+            }),
             OutputFormat::Csv => result.to_csv(),
             OutputFormat::Table => result.to_markdown_table(),
         };
@@ -189,10 +193,7 @@ impl MssqlMcpServer {
         &self,
         Parameters(input): Parameters<ExecuteProcedureInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        debug!(
-            "Executing procedure: {}.{}",
-            input.schema, input.procedure
-        );
+        debug!("Executing procedure: {}.{}", input.schema, input.procedure);
 
         // Build the EXEC statement with validated and escaped identifiers
         let escaped_schema = match safe_identifier(&input.schema) {
@@ -279,11 +280,14 @@ impl MssqlMcpServer {
         let max_rows = input
             .max_rows
             .unwrap_or(self.config.security.max_result_rows);
+        let timeout_seconds = input.timeout_seconds;
         let query = input.query;
         let sid = session_id.clone();
 
         tokio::spawn(async move {
-            let result = executor.execute_with_limit(&query, max_rows).await;
+            let result = executor
+                .execute_with_options(&query, max_rows, timeout_seconds)
+                .await;
 
             let mut state = state.write().await;
             if let Some(session) = state.get_session_mut(&sid) {
@@ -361,7 +365,8 @@ impl MssqlMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "Error serializing response".to_string()),
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| "Error serializing response".to_string()),
         )]))
     }
 
@@ -403,7 +408,8 @@ impl MssqlMcpServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "Session cancelled".to_string()),
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| "Session cancelled".to_string()),
         )]))
     }
 
@@ -433,7 +439,8 @@ impl MssqlMcpServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "Error listing sessions".to_string()),
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| "Error listing sessions".to_string()),
         )]))
     }
 
@@ -491,11 +498,10 @@ impl MssqlMcpServer {
                 } else {
                     result.clone()
                 };
-                serde_json::to_string_pretty(&limited_result)
-                    .unwrap_or_else(|e| {
-                        warn!("Failed to serialize session result to JSON: {}", e);
-                        format!("Failed to serialize result: {}", e)
-                    })
+                serde_json::to_string_pretty(&limited_result).unwrap_or_else(|e| {
+                    warn!("Failed to serialize session result to JSON: {}", e);
+                    format!("Failed to serialize result: {}", e)
+                })
             }
             OutputFormat::Csv => {
                 if truncated_by_request {
@@ -650,7 +656,8 @@ impl MssqlMcpServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "Timeout updated".to_string()),
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| "Timeout updated".to_string()),
         )]))
     }
 
@@ -685,9 +692,8 @@ impl MssqlMcpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| {
-                format!("Current timeout: {}s", current_timeout)
-            }),
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| format!("Current timeout: {}s", current_timeout)),
         )]))
     }
 
@@ -737,7 +743,11 @@ impl MssqlMcpServer {
             .max_rows
             .unwrap_or(self.config.security.max_result_rows);
 
-        let result = match self.executor.execute_with_limit(&full_query, max_rows).await {
+        let result = match self
+            .executor
+            .execute_with_limit(&full_query, max_rows)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!("Parameterized query execution failed: {}", e);
@@ -746,11 +756,13 @@ impl MssqlMcpServer {
         };
 
         let output = match input.format {
-            OutputFormat::Json => serde_json::to_string_pretty(&result)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to serialize parameterized query result to JSON: {}", e);
-                    format!("Failed to serialize result: {}", e)
-                }),
+            OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                warn!(
+                    "Failed to serialize parameterized query result to JSON: {}",
+                    e
+                );
+                format!("Failed to serialize result: {}", e)
+            }),
             OutputFormat::Csv => result.to_csv(),
             OutputFormat::Table => result.to_markdown_table(),
         };
@@ -777,8 +789,10 @@ impl MssqlMcpServer {
         );
 
         // Parse isolation level
-        let isolation_level = IsolationLevel::from_str(&input.isolation_level)
-            .unwrap_or(IsolationLevel::ReadCommitted);
+        let isolation_level = input
+            .isolation_level
+            .parse::<IsolationLevel>()
+            .unwrap_or_default();
 
         // Create transaction state (this generates the transaction ID)
         let transaction_id = {
@@ -811,7 +825,10 @@ impl MssqlMcpServer {
             return Ok(tool_error(format!("Failed to begin transaction: {}", e)));
         }
 
-        info!("Transaction {} started with dedicated connection", transaction_id);
+        info!(
+            "Transaction {} started with dedicated connection",
+            transaction_id
+        );
 
         let response = json!({
             "transaction_id": transaction_id,
@@ -1072,21 +1089,27 @@ impl MssqlMcpServer {
         debug!("Beginning pinned session");
 
         // Generate session ID
-        let session_id = format!("session_{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"));
+        let session_id = format!(
+            "session_{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        );
 
         // Create the session
-        let session_info = match self
-            .session_manager
-            .begin_session(&session_id)
-            .await
-        {
+        let session_info = match self.session_manager.begin_session(&session_id).await {
             Ok(info) => info,
             Err(e) => {
                 return Ok(tool_error(format!("Failed to begin session: {}", e)));
             }
         };
 
-        info!("Pinned session {} started with dedicated connection", session_id);
+        info!(
+            "Pinned session {} started with dedicated connection",
+            session_id
+        );
 
         let response = json!({
             "session_id": session_id,
@@ -1157,18 +1180,17 @@ impl MssqlMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         debug!("Ending pinned session: {}", input.session_id);
 
-        let session_info = match self
-            .session_manager
-            .end_session(&input.session_id)
-            .await
-        {
+        let session_info = match self.session_manager.end_session(&input.session_id).await {
             Ok(info) => info,
             Err(e) => {
                 return Ok(tool_error(format!("Failed to end session: {}", e)));
             }
         };
 
-        info!("Pinned session {} ended after {} queries", input.session_id, session_info.query_count);
+        info!(
+            "Pinned session {} ended after {} queries",
+            input.session_id, session_info.query_count
+        );
 
         let response = json!({
             "session_id": input.session_id,
@@ -1179,8 +1201,7 @@ impl MssqlMcpServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response)
-                .unwrap_or_else(|_| "Session ended".to_string()),
+            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "Session ended".to_string()),
         )]))
     }
 
@@ -1207,8 +1228,10 @@ impl MssqlMcpServer {
                     "idle_ms": s.last_activity.elapsed().as_millis(),
                 });
                 if input.detailed {
-                    info["created_at_relative"] = json!(format!("{:?} ago", s.created_at.elapsed()));
-                    info["last_activity_relative"] = json!(format!("{:?} ago", s.last_activity.elapsed()));
+                    info["created_at_relative"] =
+                        json!(format!("{:?} ago", s.created_at.elapsed()));
+                    info["last_activity_relative"] =
+                        json!(format!("{:?} ago", s.last_activity.elapsed()));
                 }
                 info
             })
@@ -1257,7 +1280,7 @@ impl MssqlMcpServer {
         }
 
         // Validate page size
-        let page_size = input.page_size.min(10000).max(1);
+        let page_size = input.page_size.clamp(1, 10000);
 
         // Determine offset based on page position
         let offset = match &input.page {
@@ -1303,11 +1326,10 @@ impl MssqlMcpServer {
 
         // Format output
         let data_output = match input.format {
-            OutputFormat::Json => serde_json::to_string_pretty(&result)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to serialize paginated result to JSON: {}", e);
-                    format!("Failed to serialize result: {}", e)
-                }),
+            OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                warn!("Failed to serialize paginated result to JSON: {}", e);
+                format!("Failed to serialize result: {}", e)
+            }),
             OutputFormat::Csv => result.to_csv(),
             OutputFormat::Table => result.to_markdown_table(),
         };
@@ -1326,11 +1348,10 @@ impl MssqlMcpServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to serialize pagination response: {}", e);
-                    format!("Pagination error: {}", e)
-                }),
+            serde_json::to_string_pretty(&response).unwrap_or_else(|e| {
+                warn!("Failed to serialize pagination response: {}", e);
+                format!("Pagination error: {}", e)
+            }),
         )]))
     }
 
@@ -1437,10 +1458,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Failed to get missing indexes: {}", e);
-                return Ok(tool_error(format!(
-                    "Failed to analyze indexes: {}",
-                    e
-                )));
+                return Ok(tool_error(format!("Failed to analyze indexes: {}", e)));
             }
         };
 
@@ -1826,11 +1844,11 @@ impl MssqlMcpServer {
         let (schema, table) = parse_table_name(&input.table)?;
         let escaped_table = format!(
             "{}.{}",
-            safe_identifier(&schema).map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
-            safe_identifier(&table).map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            safe_identifier(&schema).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+            safe_identifier(&table).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?
         );
 
-        let sample_size = input.sample_size.min(10000).max(1);
+        let sample_size = input.sample_size.clamp(1, 10000);
 
         // Build filter clause
         let filter_clause = match &input.filter {
@@ -1863,13 +1881,10 @@ impl MssqlMcpServer {
                     Some(col) => {
                         // Validate column name
                         if let Err(e) = validate_identifier(col) {
-                            return Ok(tool_error(format!(
-                                "Invalid stratify column name: {}",
-                                e
-                            )));
+                            return Ok(tool_error(format!("Invalid stratify column name: {}", e)));
                         }
                         let escaped_col = safe_identifier(col)
-                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
                         format!(
                             r#"
                             SELECT * FROM (
@@ -1911,11 +1926,10 @@ impl MssqlMcpServer {
         };
 
         let output = match input.format {
-            OutputFormat::Json => serde_json::to_string_pretty(&result)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to serialize sample data to JSON: {}", e);
-                    format!("Failed to serialize result: {}", e)
-                }),
+            OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                warn!("Failed to serialize sample data to JSON: {}", e);
+                format!("Failed to serialize result: {}", e)
+            }),
             OutputFormat::Csv => result.to_csv(),
             OutputFormat::Table => result.to_markdown_table(),
         };
@@ -1954,20 +1968,17 @@ impl MssqlMcpServer {
         let (schema, table) = parse_table_name(&input.table)?;
         let escaped_table = format!(
             "{}.{}",
-            safe_identifier(&schema).map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
-            safe_identifier(&table).map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            safe_identifier(&schema).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+            safe_identifier(&table).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?
         );
 
         // Validate and escape column names
-        let escaped_columns: Result<Vec<String>, _> = input
-            .columns
-            .iter()
-            .map(|c| safe_identifier(c))
-            .collect();
+        let escaped_columns: Result<Vec<String>, _> =
+            input.columns.iter().map(|c| safe_identifier(c)).collect();
         let escaped_columns =
-            escaped_columns.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            escaped_columns.map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
 
-        let batch_size = input.batch_size.min(5000).max(1);
+        let batch_size = input.batch_size.clamp(1, 5000);
         let mut total_inserted = 0;
         let mut errors: Vec<String> = Vec::new();
 
@@ -2004,7 +2015,7 @@ impl MssqlMcpServer {
             "rows_requested": input.rows.len(),
             "rows_inserted": total_inserted,
             "batch_size": batch_size,
-            "batches": (input.rows.len() + batch_size - 1) / batch_size,
+            "batches": input.rows.len().div_ceil(batch_size),
             "errors": errors,
             "status": if errors.is_empty() { "success" } else { "partial" },
         });
@@ -2035,7 +2046,11 @@ impl MssqlMcpServer {
             .max_rows
             .unwrap_or(self.config.security.max_result_rows);
 
-        let result = match self.executor.execute_with_limit(&input.query, max_rows).await {
+        let result = match self
+            .executor
+            .execute_with_limit(&input.query, max_rows)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!("Export query failed: {}", e);
@@ -2044,11 +2059,10 @@ impl MssqlMcpServer {
         };
 
         let output = match input.format {
-            ExportFormat::Json => serde_json::to_string_pretty(&result)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to serialize export to JSON: {}", e);
-                    format!("Failed to serialize result: {}", e)
-                }),
+            ExportFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                warn!("Failed to serialize export to JSON: {}", e);
+                format!("Failed to serialize result: {}", e)
+            }),
             ExportFormat::JsonLines => {
                 // One JSON object per line
                 result
@@ -2100,11 +2114,10 @@ impl MssqlMcpServer {
         });
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&response)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to serialize export response: {}", e);
-                    format!("Export failed: {}", e)
-                }),
+            serde_json::to_string_pretty(&response).unwrap_or_else(|e| {
+                warn!("Failed to serialize export response: {}", e);
+                format!("Export failed: {}", e)
+            }),
         )]))
     }
 
@@ -2121,7 +2134,10 @@ impl MssqlMcpServer {
         &self,
         Parameters(input): Parameters<GetMetricsInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        debug!("Getting server metrics for categories: {}", input.categories);
+        debug!(
+            "Getting server metrics for categories: {}",
+            input.categories
+        );
 
         let mut metrics = json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -2259,10 +2275,7 @@ impl MssqlMcpServer {
         &self,
         Parameters(input): Parameters<AnalyzeQueryInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        debug!(
-            "Analyzing query: {}",
-            truncate_for_log(&input.query, 100)
-        );
+        debug!("Analyzing query: {}", truncate_for_log(&input.query, 100));
 
         let mut analysis = json!({
             "query": truncate_for_log(&input.query, 500),
@@ -2427,7 +2440,8 @@ impl MssqlMcpServer {
         });
 
         // Add health assessment
-        let healthy = pool_state.idle_connections > 0 || pool_state.connections < self.config.database.pool.max_connections;
+        let healthy = pool_state.idle_connections > 0
+            || pool_state.connections < self.config.database.pool.max_connections;
         response["health"] = json!({
             "status": if healthy { "healthy" } else { "degraded" },
             "has_idle_connections": pool_state.idle_connections > 0,
@@ -2599,7 +2613,11 @@ fn build_parameterized_query(
         };
 
         declarations.push(format!("{} {}", param_name, sql_type));
-        values.push(format!("{} = {}", param_name, format_parameter_value(value)));
+        values.push(format!(
+            "{} = {}",
+            param_name,
+            format_parameter_value(value)
+        ));
     }
 
     Ok((
@@ -2643,7 +2661,7 @@ fn parse_table_name(table_ref: &str) -> Result<(String, String), ErrorData> {
     match parse_qualified_name(table_ref) {
         Ok((Some(schema), table)) => Ok((schema, table)),
         Ok((None, table)) => Ok(("dbo".to_string(), table)),
-        Err(e) => Err(ErrorData::internal_error(
+        Err(e) => Err(ErrorData::invalid_params(
             format!("Invalid table name '{}': {}", table_ref, e),
             None,
         )),

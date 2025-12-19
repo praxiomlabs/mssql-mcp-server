@@ -460,7 +460,10 @@ impl MetadataQueries {
     }
 
     /// List functions in a schema.
-    pub async fn list_functions(&self, schema: Option<&str>) -> Result<Vec<FunctionInfo>, McpError> {
+    pub async fn list_functions(
+        &self,
+        schema: Option<&str>,
+    ) -> Result<Vec<FunctionInfo>, McpError> {
         let query = format!(
             r#"
             SELECT

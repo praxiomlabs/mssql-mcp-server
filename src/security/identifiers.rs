@@ -1,8 +1,11 @@
 //! SQL Server identifier escaping utilities.
 //!
 //! Uses SQL Server's bracket notation `[identifier]` to safely escape identifiers.
+//! Also provides validation against SQL reserved keywords.
 
 use crate::error::McpError;
+use once_cell::sync::Lazy;
+use std::collections::HashSet;
 
 /// Maximum length for SQL Server identifiers.
 pub const MAX_IDENTIFIER_LENGTH: usize = 128;
@@ -89,13 +92,13 @@ pub fn validate_identifier(identifier: &str) -> Result<(), McpError> {
 
     // Check for SQL injection patterns
     let dangerous_patterns = [
-        "--",  // SQL comment
-        "/*",  // Multi-line comment start
-        "*/",  // Multi-line comment end
-        ";",   // Statement separator
-        "'",   // String delimiter
-        "\"",  // Quoted identifier delimiter (we use brackets instead)
-        "\\",  // Escape character
+        "--",   // SQL comment
+        "/*",   // Multi-line comment start
+        "*/",   // Multi-line comment end
+        ";",    // Statement separator
+        "'",    // String delimiter
+        "\"",   // Quoted identifier delimiter (we use brackets instead)
+        "\\",   // Escape character
         "\x00", // Null byte
     ];
 
@@ -113,9 +116,13 @@ pub fn validate_identifier(identifier: &str) -> Result<(), McpError> {
 
 /// Validate and escape an identifier for safe use in SQL.
 ///
-/// This combines validation and escaping for convenience.
+/// This combines validation, escaping, and reserved keyword warnings.
+/// If the identifier is a SQL reserved keyword, a warning is logged
+/// but the operation proceeds (bracket escaping makes it safe to use).
 pub fn safe_identifier(identifier: &str) -> Result<String, McpError> {
     validate_identifier(identifier)?;
+    // Warn about reserved keywords (but allow them since escaping handles it)
+    warn_if_reserved(identifier, "identifier");
     escape_identifier(identifier)
 }
 
@@ -135,6 +142,392 @@ pub fn parse_qualified_name(identifier: &str) -> Result<(Option<String>, String)
     }
 
     Ok((None, identifier.to_string()))
+}
+
+/// SQL Server reserved keywords (T-SQL 2019+).
+///
+/// Using a reserved keyword as an identifier requires bracket escaping.
+/// This list includes both ANSI SQL and T-SQL specific reserved words.
+static SQL_RESERVED_KEYWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    [
+        // ANSI SQL reserved words
+        "ADD",
+        "ALL",
+        "ALTER",
+        "AND",
+        "ANY",
+        "AS",
+        "ASC",
+        "AUTHORIZATION",
+        "BACKUP",
+        "BEGIN",
+        "BETWEEN",
+        "BREAK",
+        "BROWSE",
+        "BULK",
+        "BY",
+        "CASCADE",
+        "CASE",
+        "CHECK",
+        "CHECKPOINT",
+        "CLOSE",
+        "CLUSTERED",
+        "COALESCE",
+        "COLLATE",
+        "COLUMN",
+        "COMMIT",
+        "COMPUTE",
+        "CONSTRAINT",
+        "CONTAINS",
+        "CONTAINSTABLE",
+        "CONTINUE",
+        "CONVERT",
+        "CREATE",
+        "CROSS",
+        "CURRENT",
+        "CURRENT_DATE",
+        "CURRENT_TIME",
+        "CURRENT_TIMESTAMP",
+        "CURRENT_USER",
+        "CURSOR",
+        "DATABASE",
+        "DBCC",
+        "DEALLOCATE",
+        "DECLARE",
+        "DEFAULT",
+        "DELETE",
+        "DENY",
+        "DESC",
+        "DISK",
+        "DISTINCT",
+        "DISTRIBUTED",
+        "DOUBLE",
+        "DROP",
+        "DUMP",
+        "ELSE",
+        "END",
+        "ERRLVL",
+        "ESCAPE",
+        "EXCEPT",
+        "EXEC",
+        "EXECUTE",
+        "EXISTS",
+        "EXIT",
+        "EXTERNAL",
+        "FETCH",
+        "FILE",
+        "FILLFACTOR",
+        "FOR",
+        "FOREIGN",
+        "FREETEXT",
+        "FREETEXTTABLE",
+        "FROM",
+        "FULL",
+        "FUNCTION",
+        "GOTO",
+        "GRANT",
+        "GROUP",
+        "HAVING",
+        "HOLDLOCK",
+        "IDENTITY",
+        "IDENTITY_INSERT",
+        "IDENTITYCOL",
+        "IF",
+        "IN",
+        "INDEX",
+        "INNER",
+        "INSERT",
+        "INTERSECT",
+        "INTO",
+        "IS",
+        "JOIN",
+        "KEY",
+        "KILL",
+        "LEFT",
+        "LIKE",
+        "LINENO",
+        "LOAD",
+        "MERGE",
+        "NATIONAL",
+        "NOCHECK",
+        "NONCLUSTERED",
+        "NOT",
+        "NULL",
+        "NULLIF",
+        "OF",
+        "OFF",
+        "OFFSETS",
+        "ON",
+        "OPEN",
+        "OPENDATASOURCE",
+        "OPENQUERY",
+        "OPENROWSET",
+        "OPENXML",
+        "OPTION",
+        "OR",
+        "ORDER",
+        "OUTER",
+        "OVER",
+        "PERCENT",
+        "PIVOT",
+        "PLAN",
+        "PRECISION",
+        "PRIMARY",
+        "PRINT",
+        "PROC",
+        "PROCEDURE",
+        "PUBLIC",
+        "RAISERROR",
+        "READ",
+        "READTEXT",
+        "RECONFIGURE",
+        "REFERENCES",
+        "REPLICATION",
+        "RESTORE",
+        "RESTRICT",
+        "RETURN",
+        "REVERT",
+        "REVOKE",
+        "RIGHT",
+        "ROLLBACK",
+        "ROWCOUNT",
+        "ROWGUIDCOL",
+        "RULE",
+        "SAVE",
+        "SCHEMA",
+        "SECURITYAUDIT",
+        "SELECT",
+        "SEMANTICKEYPHRASETABLE",
+        "SEMANTICSIMILARITYDETAILSTABLE",
+        "SEMANTICSIMILARITYTABLE",
+        "SESSION_USER",
+        "SET",
+        "SETUSER",
+        "SHUTDOWN",
+        "SOME",
+        "STATISTICS",
+        "SYSTEM_USER",
+        "TABLE",
+        "TABLESAMPLE",
+        "TEXTSIZE",
+        "THEN",
+        "TO",
+        "TOP",
+        "TRAN",
+        "TRANSACTION",
+        "TRIGGER",
+        "TRUNCATE",
+        "TRY_CONVERT",
+        "TSEQUAL",
+        "UNION",
+        "UNIQUE",
+        "UNPIVOT",
+        "UPDATE",
+        "UPDATETEXT",
+        "USE",
+        "USER",
+        "VALUES",
+        "VARYING",
+        "VIEW",
+        "WAITFOR",
+        "WHEN",
+        "WHERE",
+        "WHILE",
+        "WITH",
+        "WITHIN GROUP",
+        "WRITETEXT",
+        // Additional T-SQL keywords
+        "ABS",
+        "ACOS",
+        "APP_NAME",
+        "ASCII",
+        "ASIN",
+        "ATAN",
+        "ATN2",
+        "AVG",
+        "BINARY",
+        "BIT",
+        "CAST",
+        "CEILING",
+        "CHAR",
+        "CHARINDEX",
+        "CHOOSE",
+        "COS",
+        "COT",
+        "COUNT",
+        "COUNT_BIG",
+        "DATALENGTH",
+        "DATEADD",
+        "DATEDIFF",
+        "DATEFROMPARTS",
+        "DATENAME",
+        "DATEPART",
+        "DATETIME",
+        "DATETIME2",
+        "DATETIMEOFFSET",
+        "DAY",
+        "DB_ID",
+        "DB_NAME",
+        "DECIMAL",
+        "EXP",
+        "FLOAT",
+        "FLOOR",
+        "FORMAT",
+        "GETDATE",
+        "GETUTCDATE",
+        "GO",
+        "HOST_ID",
+        "HOST_NAME",
+        "IIF",
+        "IMAGE",
+        "INT",
+        "ISNULL",
+        "ISNUMERIC",
+        "LEN",
+        "LOG",
+        "LOG10",
+        "LOWER",
+        "LTRIM",
+        "MAX",
+        "MIN",
+        "MONEY",
+        "MONTH",
+        "NCHAR",
+        "NEWID",
+        "NTEXT",
+        "NUMERIC",
+        "NVARCHAR",
+        "OBJECT_ID",
+        "OBJECT_NAME",
+        "PARSE",
+        "PATINDEX",
+        "PERMISSIONS",
+        "PI",
+        "POWER",
+        "QUOTENAME",
+        "RAND",
+        "REAL",
+        "REPLACE",
+        "REPLICATE",
+        "REVERSE",
+        "ROUND",
+        "ROW_NUMBER",
+        "RTRIM",
+        "SCOPE_IDENTITY",
+        "SIGN",
+        "SIN",
+        "SMALLDATETIME",
+        "SMALLINT",
+        "SMALLMONEY",
+        "SOUNDEX",
+        "SPACE",
+        "SQL_VARIANT",
+        "SQRT",
+        "STR",
+        "STRING_SPLIT",
+        "STUFF",
+        "SUBSTRING",
+        "SUM",
+        "SUSER_NAME",
+        "TAN",
+        "TEXT",
+        "TIME",
+        "TIMESTAMP",
+        "TINYINT",
+        "TRANSLATE",
+        "TRIM",
+        "TYPE_ID",
+        "TYPE_NAME",
+        "UNICODE",
+        "UNIQUEIDENTIFIER",
+        "UPPER",
+        "USER_ID",
+        "USER_NAME",
+        "VARBINARY",
+        "VARCHAR",
+        "XACT_STATE",
+        "XML",
+        "YEAR",
+    ]
+    .iter()
+    .copied()
+    .collect()
+});
+
+/// Check if an identifier is a SQL reserved keyword.
+///
+/// Returns true if the identifier (case-insensitive) matches a SQL Server reserved keyword.
+pub fn is_reserved_keyword(identifier: &str) -> bool {
+    SQL_RESERVED_KEYWORDS.contains(identifier.to_uppercase().as_str())
+}
+
+/// Validate that an identifier is not a reserved keyword.
+///
+/// Returns an error if the identifier is a reserved keyword without bracket escaping.
+pub fn validate_not_reserved(identifier: &str) -> Result<(), McpError> {
+    // Extract the actual name from bracket-escaped identifiers
+    let name = if identifier.starts_with('[') && identifier.ends_with(']') {
+        // Already escaped, so it's safe to use
+        return Ok(());
+    } else if identifier.contains('.') {
+        // For qualified names, check each part
+        for part in identifier.split('.') {
+            let clean_part = if part.starts_with('[') && part.ends_with(']') {
+                continue; // Already escaped
+            } else {
+                part.trim()
+            };
+
+            if is_reserved_keyword(clean_part) {
+                return Err(McpError::invalid_input(format!(
+                    "'{}' is a SQL reserved keyword. Consider using bracket escaping: [{}]",
+                    clean_part, clean_part
+                )));
+            }
+        }
+        return Ok(());
+    } else {
+        identifier.trim()
+    };
+
+    if is_reserved_keyword(name) {
+        return Err(McpError::invalid_input(format!(
+            "'{}' is a SQL reserved keyword. Consider using bracket escaping: [{}]",
+            name, name
+        )));
+    }
+
+    Ok(())
+}
+
+/// Warn (log) if an identifier is a reserved keyword.
+///
+/// Unlike `validate_not_reserved`, this doesn't return an error, just logs a warning.
+/// This is useful for soft validation where we want to notify but not block.
+pub fn warn_if_reserved(identifier: &str, context: &str) {
+    let check_name = |name: &str| {
+        if is_reserved_keyword(name) {
+            tracing::warn!(
+                "{}: '{}' is a SQL reserved keyword. This may cause issues in some contexts.",
+                context,
+                name
+            );
+        }
+    };
+
+    if identifier.starts_with('[') && identifier.ends_with(']') {
+        return; // Already escaped
+    }
+
+    if identifier.contains('.') {
+        for part in identifier.split('.') {
+            if !(part.starts_with('[') && part.ends_with(']')) {
+                check_name(part.trim());
+            }
+        }
+    } else {
+        check_name(identifier.trim());
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +595,58 @@ mod tests {
         let (schema, name) = parse_qualified_name("Users").unwrap();
         assert_eq!(schema, None);
         assert_eq!(name, "Users");
+    }
+
+    #[test]
+    fn test_is_reserved_keyword() {
+        // Common reserved keywords
+        assert!(is_reserved_keyword("SELECT"));
+        assert!(is_reserved_keyword("select")); // case insensitive
+        assert!(is_reserved_keyword("INSERT"));
+        assert!(is_reserved_keyword("UPDATE"));
+        assert!(is_reserved_keyword("DELETE"));
+        assert!(is_reserved_keyword("DROP"));
+        assert!(is_reserved_keyword("TABLE"));
+        assert!(is_reserved_keyword("FROM"));
+        assert!(is_reserved_keyword("WHERE"));
+
+        // T-SQL specific
+        assert!(is_reserved_keyword("EXEC"));
+        assert!(is_reserved_keyword("DECLARE"));
+        assert!(is_reserved_keyword("GETDATE"));
+
+        // Not reserved
+        assert!(!is_reserved_keyword("Users"));
+        assert!(!is_reserved_keyword("MyTable"));
+        assert!(!is_reserved_keyword("CustomerName"));
+    }
+
+    #[test]
+    fn test_validate_not_reserved() {
+        // Normal identifiers should pass
+        assert!(validate_not_reserved("Users").is_ok());
+        assert!(validate_not_reserved("my_table").is_ok());
+        assert!(validate_not_reserved("dbo.Users").is_ok());
+
+        // Reserved keywords should fail
+        assert!(validate_not_reserved("select").is_err());
+        assert!(validate_not_reserved("TABLE").is_err());
+        assert!(validate_not_reserved("from").is_err());
+
+        // Escaped identifiers should pass even if they're keywords
+        assert!(validate_not_reserved("[SELECT]").is_ok());
+        assert!(validate_not_reserved("[TABLE]").is_ok());
+        assert!(validate_not_reserved("dbo.[SELECT]").is_ok());
+        assert!(validate_not_reserved("[dbo].[TABLE]").is_ok());
+
+        // Qualified names with reserved keywords
+        assert!(validate_not_reserved("dbo.SELECT").is_err());
+    }
+
+    #[test]
+    fn test_reserved_keyword_count() {
+        // Sanity check that we have a reasonable number of keywords
+        assert!(SQL_RESERVED_KEYWORDS.len() > 200);
+        assert!(SQL_RESERVED_KEYWORDS.len() < 400);
     }
 }

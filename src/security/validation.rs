@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Query validation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ValidationMode {
     /// Read-only mode: Only SELECT queries allowed.
     /// Blocks: INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, EXEC, etc.
@@ -15,17 +15,12 @@ pub enum ValidationMode {
     /// Standard mode: DML allowed, DDL blocked.
     /// Allows: SELECT, INSERT, UPDATE, DELETE
     /// Blocks: DROP, CREATE, ALTER, TRUNCATE, EXEC (dangerous stored procs)
+    #[default]
     Standard,
 
     /// Unrestricted mode: All queries allowed.
     /// Warning: Use only with trusted inputs or proper database permissions.
     Unrestricted,
-}
-
-impl Default for ValidationMode {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 /// Result of query validation.
@@ -131,7 +126,10 @@ static DANGEROUS_KEYWORDS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
         (compile(r"(?i)\bsp_configure\b"), "sp_configure"),
         (compile(r"(?i)\bsp_addlogin\b"), "sp_addlogin"),
         (compile(r"(?i)\bsp_droplogin\b"), "sp_droplogin"),
-        (compile(r"(?i)\bsp_addsrvrolemember\b"), "sp_addsrvrolemember"),
+        (
+            compile(r"(?i)\bsp_addsrvrolemember\b"),
+            "sp_addsrvrolemember",
+        ),
         // Bulk operations
         (compile(r"(?i)\bBULK\s+INSERT\b"), "BULK INSERT"),
         (compile(r"(?i)\bOPENROWSET\b"), "OPENROWSET"),

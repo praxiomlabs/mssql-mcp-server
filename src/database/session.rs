@@ -5,6 +5,7 @@
 //! lifetime of a session, allowing temp tables, session variables, and
 //! SET options to persist across queries.
 
+use super::auth::{create_connection, truncate_for_log, RawConnection};
 use crate::config::DatabaseConfig;
 use crate::database::query::{ColumnInfo, QueryResult, ResultRow};
 use crate::database::types::TypeMapper;
@@ -12,14 +13,8 @@ use crate::error::McpError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, warn};
-
-/// Type alias for a raw tiberius connection.
-pub type RawConnection = Client<Compat<TcpStream>>;
 
 /// Metadata about a pinned session.
 #[derive(Debug, Clone)]
@@ -70,65 +65,8 @@ impl SessionManager {
     }
 
     /// Create a new raw connection using the database configuration.
-    async fn create_connection(&self) -> Result<RawConnection, McpError> {
-        let mut config = Config::new();
-
-        // Set host and port
-        config.host(&self.db_config.host);
-        config.port(self.db_config.port);
-
-        // Set database if specified
-        if let Some(ref database) = self.db_config.database {
-            config.database(database);
-        }
-
-        // Configure authentication
-        match &self.db_config.auth {
-            crate::config::AuthConfig::SqlServer { username, password } => {
-                config.authentication(AuthMethod::sql_server(username, password));
-            }
-            #[cfg(windows)]
-            crate::config::AuthConfig::Windows => {
-                config.authentication(AuthMethod::Integrated);
-            }
-            crate::config::AuthConfig::AzureAd { .. } => {
-                return Err(McpError::config(
-                    "Azure AD authentication is not yet supported",
-                ));
-            }
-        }
-
-        // Configure encryption
-        if self.db_config.encrypt {
-            config.encryption(EncryptionLevel::Required);
-        } else {
-            config.encryption(EncryptionLevel::Off);
-        }
-
-        // Trust server certificate if requested
-        if self.db_config.trust_server_certificate {
-            config.trust_cert();
-        }
-
-        // Set application name with session indicator
-        config.application_name(&format!("{}-session", self.db_config.application_name));
-
-        let address = format!("{}:{}", self.db_config.host, self.db_config.port);
-        debug!("Creating session connection to {}", address);
-
-        let tcp = TcpStream::connect(&address)
-            .await
-            .map_err(|e| McpError::connection(format!("Failed to connect: {}", e)))?;
-
-        tcp.set_nodelay(true)
-            .map_err(|e| McpError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
-
-        let client = Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|e| McpError::connection(format!("Failed to connect to SQL Server: {}", e)))?;
-
-        debug!("Session connection established");
-        Ok(client)
+    async fn create_session_connection(&self) -> Result<RawConnection, McpError> {
+        create_connection(&self.db_config, Some("session")).await
     }
 
     /// Begin a new pinned session.
@@ -147,7 +85,7 @@ impl SessionManager {
         }
 
         // Create a dedicated connection for this session
-        let conn = self.create_connection().await?;
+        let conn = self.create_session_connection().await?;
 
         let info = SessionInfo {
             id: session_id.to_string(),
@@ -160,10 +98,7 @@ impl SessionManager {
         let mut connections = self.connections.lock().await;
         connections.insert(session_id.to_string(), (conn, info.clone()));
 
-        debug!(
-            "Session {} started with dedicated connection",
-            session_id
-        );
+        debug!("Session {} started with dedicated connection", session_id);
         Ok(info)
     }
 
@@ -176,9 +111,9 @@ impl SessionManager {
         let start = Instant::now();
 
         let mut connections = self.connections.lock().await;
-        let (conn, info) = connections.get_mut(session_id).ok_or_else(|| {
-            McpError::Session(format!("Session not found: {}", session_id))
-        })?;
+        let (conn, info) = connections
+            .get_mut(session_id)
+            .ok_or_else(|| McpError::Session(format!("Session not found: {}", session_id)))?;
 
         // Update last activity and query count
         info.last_activity = Instant::now();
@@ -214,9 +149,9 @@ impl SessionManager {
     /// End a session and release its connection.
     pub async fn end_session(&self, session_id: &str) -> Result<SessionInfo, McpError> {
         let mut connections = self.connections.lock().await;
-        let (mut conn, info) = connections.remove(session_id).ok_or_else(|| {
-            McpError::Session(format!("Session not found: {}", session_id))
-        })?;
+        let (mut conn, info) = connections
+            .remove(session_id)
+            .ok_or_else(|| McpError::Session(format!("Session not found: {}", session_id)))?;
 
         // Clean up any temp tables or transactions before closing
         // This is best-effort - we don't fail if cleanup fails
@@ -244,10 +179,7 @@ impl SessionManager {
     /// List all active sessions.
     pub async fn list_sessions(&self) -> Vec<SessionInfo> {
         let connections = self.connections.lock().await;
-        connections
-            .values()
-            .map(|(_, info)| info.clone())
-            .collect()
+        connections.values().map(|(_, info)| info.clone()).collect()
     }
 
     /// Check if a session exists.
@@ -341,28 +273,5 @@ impl SessionManager {
             execution_time_ms: start.elapsed().as_millis() as u64,
             truncated,
         }
-    }
-}
-
-/// Truncate a string for logging purposes.
-fn truncate_for_log(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_truncate_for_log() {
-        assert_eq!(truncate_for_log("short", 10), "short");
-        assert_eq!(
-            truncate_for_log("this is a long string", 10),
-            "this is a ..."
-        );
     }
 }

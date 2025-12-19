@@ -19,7 +19,8 @@ pub const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// Default connection timeout as Duration.
-pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS);
+pub const DEFAULT_CONNECTION_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS);
 
 /// Default query timeout as Duration.
 pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS);
@@ -61,6 +62,11 @@ pub const MAX_SAMPLE_SIZE: usize = 10_000;
 
 /// Default batch size for bulk inserts.
 pub const DEFAULT_BATCH_SIZE: usize = 1000;
+
+// Compile-time assertions to ensure constant relationships are valid
+const _: () = assert!(DEFAULT_PAGE_SIZE >= MIN_PAGE_SIZE);
+const _: () = assert!(DEFAULT_PAGE_SIZE <= MAX_PAGE_SIZE);
+const _: () = assert!(DEFAULT_SAMPLE_SIZE <= MAX_SAMPLE_SIZE);
 
 // =============================================================================
 // Cache Constants
@@ -176,14 +182,6 @@ mod tests {
         assert_eq!(DEFAULT_FORCE_TIMEOUT, Duration::from_secs(10));
     }
 
-    #[test]
-    fn test_page_size_bounds() {
-        assert!(DEFAULT_PAGE_SIZE >= MIN_PAGE_SIZE);
-        assert!(DEFAULT_PAGE_SIZE <= MAX_PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_sample_size_bounds() {
-        assert!(DEFAULT_SAMPLE_SIZE <= MAX_SAMPLE_SIZE);
-    }
+    // Note: Page size and sample size bounds are verified at compile time
+    // via const assertions in the module body
 }

@@ -237,11 +237,7 @@ impl std::fmt::Display for ResourceParseError {
                 )
             }
             ParseErrorReason::InvalidIdentifier { identifier, reason } => {
-                write!(
-                    f,
-                    "invalid identifier '{}': {}",
-                    identifier, reason
-                )
+                write!(f, "invalid identifier '{}': {}", identifier, reason)
             }
             ParseErrorReason::MissingComponent { expected } => {
                 write!(f, "missing required component: {}", expected)
@@ -292,13 +288,13 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceUri, ResourceParseError> {
         ["schemas"] => Ok(ResourceUri::Schemas),
         ["tables"] => Ok(ResourceUri::Tables),
         // Support both mssql://tables/schema/table and mssql://tables/schema.table formats
-        ["tables", qualified] => {
-            parse_and_validate_qualified_name(qualified, uri)
-                .map(|(schema, table)| ResourceUri::TableDetails { schema, table })
-        }
+        ["tables", qualified] => parse_and_validate_qualified_name(qualified, uri)
+            .map(|(schema, table)| ResourceUri::TableDetails { schema, table }),
         ["tables", schema, table] => {
-            validate_schema_and_name(schema, table, uri)
-                .map(|(s, t)| ResourceUri::TableDetails { schema: s, table: t })
+            validate_schema_and_name(schema, table, uri).map(|(s, t)| ResourceUri::TableDetails {
+                schema: s,
+                table: t,
+            })
         }
         ["tables", ..] => Err(ResourceParseError {
             uri: uri.to_string(),
@@ -308,14 +304,10 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceUri, ResourceParseError> {
             },
         }),
         ["views"] => Ok(ResourceUri::Views),
-        ["views", qualified] => {
-            parse_and_validate_qualified_name(qualified, uri)
-                .map(|(schema, view)| ResourceUri::ViewDetails { schema, view })
-        }
-        ["views", schema, view] => {
-            validate_schema_and_name(schema, view, uri)
-                .map(|(s, v)| ResourceUri::ViewDetails { schema: s, view: v })
-        }
+        ["views", qualified] => parse_and_validate_qualified_name(qualified, uri)
+            .map(|(schema, view)| ResourceUri::ViewDetails { schema, view }),
+        ["views", schema, view] => validate_schema_and_name(schema, view, uri)
+            .map(|(s, v)| ResourceUri::ViewDetails { schema: s, view: v }),
         ["views", ..] => Err(ResourceParseError {
             uri: uri.to_string(),
             reason: ParseErrorReason::TooManySegments {
@@ -324,13 +316,15 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceUri, ResourceParseError> {
             },
         }),
         ["procedures"] => Ok(ResourceUri::Procedures),
-        ["procedures", qualified] => {
-            parse_and_validate_qualified_name(qualified, uri)
-                .map(|(schema, procedure)| ResourceUri::ProcedureDetails { schema, procedure })
-        }
+        ["procedures", qualified] => parse_and_validate_qualified_name(qualified, uri)
+            .map(|(schema, procedure)| ResourceUri::ProcedureDetails { schema, procedure }),
         ["procedures", schema, procedure] => {
-            validate_schema_and_name(schema, procedure, uri)
-                .map(|(s, p)| ResourceUri::ProcedureDetails { schema: s, procedure: p })
+            validate_schema_and_name(schema, procedure, uri).map(|(s, p)| {
+                ResourceUri::ProcedureDetails {
+                    schema: s,
+                    procedure: p,
+                }
+            })
         }
         ["procedures", ..] => Err(ResourceParseError {
             uri: uri.to_string(),
@@ -340,13 +334,15 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceUri, ResourceParseError> {
             },
         }),
         ["functions"] => Ok(ResourceUri::Functions),
-        ["functions", qualified] => {
-            parse_and_validate_qualified_name(qualified, uri)
-                .map(|(schema, function)| ResourceUri::FunctionDetails { schema, function })
-        }
+        ["functions", qualified] => parse_and_validate_qualified_name(qualified, uri)
+            .map(|(schema, function)| ResourceUri::FunctionDetails { schema, function }),
         ["functions", schema, function] => {
-            validate_schema_and_name(schema, function, uri)
-                .map(|(s, f)| ResourceUri::FunctionDetails { schema: s, function: f })
+            validate_schema_and_name(schema, function, uri).map(|(s, f)| {
+                ResourceUri::FunctionDetails {
+                    schema: s,
+                    function: f,
+                }
+            })
         }
         ["functions", ..] => Err(ResourceParseError {
             uri: uri.to_string(),
@@ -356,13 +352,15 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceUri, ResourceParseError> {
             },
         }),
         ["triggers"] => Ok(ResourceUri::Triggers),
-        ["triggers", qualified] => {
-            parse_and_validate_qualified_name(qualified, uri)
-                .map(|(schema, trigger)| ResourceUri::TriggerDetails { schema, trigger })
-        }
+        ["triggers", qualified] => parse_and_validate_qualified_name(qualified, uri)
+            .map(|(schema, trigger)| ResourceUri::TriggerDetails { schema, trigger }),
         ["triggers", schema, trigger] => {
-            validate_schema_and_name(schema, trigger, uri)
-                .map(|(s, t)| ResourceUri::TriggerDetails { schema: s, trigger: t })
+            validate_schema_and_name(schema, trigger, uri).map(|(s, t)| {
+                ResourceUri::TriggerDetails {
+                    schema: s,
+                    trigger: t,
+                }
+            })
         }
         ["triggers", ..] => Err(ResourceParseError {
             uri: uri.to_string(),
@@ -784,7 +782,10 @@ mod tests {
         let result = parse_resource_uri("mssql://unknown");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err.reason, ParseErrorReason::UnknownResourceType { .. }));
+        assert!(matches!(
+            err.reason,
+            ParseErrorReason::UnknownResourceType { .. }
+        ));
         assert!(err.to_string().contains("unknown resource type"));
     }
 
@@ -830,17 +831,26 @@ mod tests {
         let result = parse_resource_uri("mssql://tables/dbo/Users--");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err.reason, ParseErrorReason::InvalidIdentifier { .. }));
+        assert!(matches!(
+            err.reason,
+            ParseErrorReason::InvalidIdentifier { .. }
+        ));
 
         let result = parse_resource_uri("mssql://tables/dbo/Users;DROP");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err.reason, ParseErrorReason::InvalidIdentifier { .. }));
+        assert!(matches!(
+            err.reason,
+            ParseErrorReason::InvalidIdentifier { .. }
+        ));
 
         let result = parse_resource_uri("mssql://tables/dbo'/Users");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err.reason, ParseErrorReason::InvalidIdentifier { .. }));
+        assert!(matches!(
+            err.reason,
+            ParseErrorReason::InvalidIdentifier { .. }
+        ));
     }
 
     #[test]

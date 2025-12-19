@@ -144,7 +144,12 @@ pub struct QueryCache {
 
 impl QueryCache {
     /// Create a new query cache.
-    pub fn new(default_ttl: Duration, max_size_mb: usize, max_entries: usize, enabled: bool) -> Self {
+    pub fn new(
+        default_ttl: Duration,
+        max_size_mb: usize,
+        max_entries: usize,
+        enabled: bool,
+    ) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
             default_ttl,
@@ -234,7 +239,11 @@ impl QueryCache {
     }
 
     /// Evict entries to make room.
-    async fn evict_entries(&self, entries: &mut HashMap<CacheKey, CacheEntry>, needed_bytes: usize) -> usize {
+    async fn evict_entries(
+        &self,
+        entries: &mut HashMap<CacheKey, CacheEntry>,
+        needed_bytes: usize,
+    ) -> usize {
         let mut evicted = 0;
 
         // First, remove all expired entries
@@ -328,8 +337,18 @@ impl QueryCache {
 pub type SharedCache = Arc<QueryCache>;
 
 /// Create a new shared cache.
-pub fn new_shared_cache(default_ttl: Duration, max_size_mb: usize, max_entries: usize, enabled: bool) -> SharedCache {
-    Arc::new(QueryCache::new(default_ttl, max_size_mb, max_entries, enabled))
+pub fn new_shared_cache(
+    default_ttl: Duration,
+    max_size_mb: usize,
+    max_entries: usize,
+    enabled: bool,
+) -> SharedCache {
+    Arc::new(QueryCache::new(
+        default_ttl,
+        max_size_mb,
+        max_entries,
+        enabled,
+    ))
 }
 
 /// Normalize a query string for caching.

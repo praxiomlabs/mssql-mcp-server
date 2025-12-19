@@ -4,21 +4,16 @@
 //! Unlike pooled connections, transaction connections are held for the
 //! entire lifetime of a transaction to maintain transaction state.
 
+use super::auth::{create_connection, truncate_for_log, RawConnection};
 use crate::config::DatabaseConfig;
-use crate::database::types::TypeMapper;
 use crate::database::query::{ColumnInfo, QueryResult, ResultRow};
+use crate::database::types::TypeMapper;
 use crate::error::McpError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, warn};
-
-/// Type alias for a raw tiberius connection.
-pub type RawConnection = Client<Compat<TcpStream>>;
 
 /// Manager for transaction-dedicated connections.
 ///
@@ -47,65 +42,8 @@ impl TransactionManager {
     }
 
     /// Create a new raw connection using the database configuration.
-    async fn create_connection(&self) -> Result<RawConnection, McpError> {
-        let mut config = Config::new();
-
-        // Set host and port
-        config.host(&self.db_config.host);
-        config.port(self.db_config.port);
-
-        // Set database if specified
-        if let Some(ref database) = self.db_config.database {
-            config.database(database);
-        }
-
-        // Configure authentication
-        match &self.db_config.auth {
-            crate::config::AuthConfig::SqlServer { username, password } => {
-                config.authentication(AuthMethod::sql_server(username, password));
-            }
-            #[cfg(windows)]
-            crate::config::AuthConfig::Windows => {
-                config.authentication(AuthMethod::Integrated);
-            }
-            crate::config::AuthConfig::AzureAd { .. } => {
-                return Err(McpError::config(
-                    "Azure AD authentication is not yet supported",
-                ));
-            }
-        }
-
-        // Configure encryption
-        if self.db_config.encrypt {
-            config.encryption(EncryptionLevel::Required);
-        } else {
-            config.encryption(EncryptionLevel::Off);
-        }
-
-        // Trust server certificate if requested
-        if self.db_config.trust_server_certificate {
-            config.trust_cert();
-        }
-
-        // Set application name with transaction indicator
-        config.application_name(&format!("{}-txn", self.db_config.application_name));
-
-        let address = format!("{}:{}", self.db_config.host, self.db_config.port);
-        debug!("Creating transaction connection to {}", address);
-
-        let tcp = TcpStream::connect(&address)
-            .await
-            .map_err(|e| McpError::connection(format!("Failed to connect: {}", e)))?;
-
-        tcp.set_nodelay(true)
-            .map_err(|e| McpError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
-
-        let client = Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|e| McpError::connection(format!("Failed to connect to SQL Server: {}", e)))?;
-
-        debug!("Transaction connection established");
-        Ok(client)
+    async fn create_txn_connection(&self) -> Result<RawConnection, McpError> {
+        create_connection(&self.db_config, Some("txn")).await
     }
 
     /// Begin a new transaction and store its dedicated connection.
@@ -118,7 +56,7 @@ impl TransactionManager {
         name: Option<&str>,
     ) -> Result<(), McpError> {
         // Create a dedicated connection for this transaction
-        let mut conn = self.create_connection().await?;
+        let mut conn = self.create_txn_connection().await?;
 
         // Set isolation level and begin transaction
         let set_isolation = format!("SET TRANSACTION ISOLATION LEVEL {}", isolation_level);
@@ -147,7 +85,10 @@ impl TransactionManager {
         let mut connections = self.connections.lock().await;
         connections.insert(transaction_id.to_string(), conn);
 
-        debug!("Transaction {} started with dedicated connection", transaction_id);
+        debug!(
+            "Transaction {} started with dedicated connection",
+            transaction_id
+        );
         Ok(())
     }
 
@@ -161,10 +102,17 @@ impl TransactionManager {
 
         let mut connections = self.connections.lock().await;
         let conn = connections.get_mut(transaction_id).ok_or_else(|| {
-            McpError::Session(format!("Transaction connection not found: {}", transaction_id))
+            McpError::Session(format!(
+                "Transaction connection not found: {}",
+                transaction_id
+            ))
         })?;
 
-        debug!("Executing in transaction {}: {}", transaction_id, truncate_for_log(query, 100));
+        debug!(
+            "Executing in transaction {}: {}",
+            transaction_id,
+            truncate_for_log(query, 100)
+        );
 
         // Execute query
         let stream = conn
@@ -192,7 +140,10 @@ impl TransactionManager {
     ) -> Result<(), McpError> {
         let mut connections = self.connections.lock().await;
         let mut conn = connections.remove(transaction_id).ok_or_else(|| {
-            McpError::Session(format!("Transaction connection not found: {}", transaction_id))
+            McpError::Session(format!(
+                "Transaction connection not found: {}",
+                transaction_id
+            ))
         })?;
 
         let commit_sql = match name {
@@ -207,7 +158,10 @@ impl TransactionManager {
             .await
             .map_err(|e| McpError::query_error(format!("Failed to commit transaction: {}", e)))?;
 
-        debug!("Transaction {} committed, connection released", transaction_id);
+        debug!(
+            "Transaction {} committed, connection released",
+            transaction_id
+        );
         // Connection is dropped here when it goes out of scope
         Ok(())
     }
@@ -224,24 +178,37 @@ impl TransactionManager {
         // For savepoint rollback, we don't remove the connection
         if let Some(sp) = savepoint {
             let conn = connections.get_mut(transaction_id).ok_or_else(|| {
-                McpError::Session(format!("Transaction connection not found: {}", transaction_id))
+                McpError::Session(format!(
+                    "Transaction connection not found: {}",
+                    transaction_id
+                ))
             })?;
 
             let rollback_sql = format!("ROLLBACK TRANSACTION [{}]", sp.replace(']', "]]"));
             conn.simple_query(&rollback_sql)
                 .await
-                .map_err(|e| McpError::query_error(format!("Failed to rollback to savepoint: {}", e)))?
+                .map_err(|e| {
+                    McpError::query_error(format!("Failed to rollback to savepoint: {}", e))
+                })?
                 .into_results()
                 .await
-                .map_err(|e| McpError::query_error(format!("Failed to rollback to savepoint: {}", e)))?;
+                .map_err(|e| {
+                    McpError::query_error(format!("Failed to rollback to savepoint: {}", e))
+                })?;
 
-            debug!("Transaction {} rolled back to savepoint {}", transaction_id, sp);
+            debug!(
+                "Transaction {} rolled back to savepoint {}",
+                transaction_id, sp
+            );
             return Ok(false); // Transaction still active
         }
 
         // Full rollback - remove and close connection
         let mut conn = connections.remove(transaction_id).ok_or_else(|| {
-            McpError::Session(format!("Transaction connection not found: {}", transaction_id))
+            McpError::Session(format!(
+                "Transaction connection not found: {}",
+                transaction_id
+            ))
         })?;
 
         let rollback_sql = match name {
@@ -256,7 +223,10 @@ impl TransactionManager {
             .await
             .map_err(|e| McpError::query_error(format!("Failed to rollback transaction: {}", e)))?;
 
-        debug!("Transaction {} rolled back, connection released", transaction_id);
+        debug!(
+            "Transaction {} rolled back, connection released",
+            transaction_id
+        );
         // Connection is dropped here
         Ok(true) // Transaction ended
     }
@@ -287,7 +257,11 @@ impl TransactionManager {
         let rows_affected: u64 = 0;
         let mut truncated = false;
 
-        while let Some(item) = stream.try_next().await.map_err(|e| McpError::query_error(e.to_string()))? {
+        while let Some(item) = stream
+            .try_next()
+            .await
+            .map_err(|e| McpError::query_error(e.to_string()))?
+        {
             match item {
                 tiberius::QueryItem::Metadata(meta) => {
                     columns = meta
@@ -340,30 +314,13 @@ impl TransactionManager {
             warn!("Cleaning up orphaned transaction connection: {}", id);
             if let Some(mut conn) = connections.remove(&id) {
                 // Try to rollback before dropping - consume results for proper cleanup
-                if let Ok(stream) = conn.simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await {
+                if let Ok(stream) = conn
+                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                    .await
+                {
                     let _ = stream.into_results().await;
                 }
             }
         }
-    }
-}
-
-/// Truncate a string for logging purposes.
-fn truncate_for_log(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_truncate_for_log() {
-        assert_eq!(truncate_for_log("short", 10), "short");
-        assert_eq!(truncate_for_log("this is a long string", 10), "this is a ...");
     }
 }
