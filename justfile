@@ -290,13 +290,19 @@ msrv-check:
     cargo +{{msrv}} check --all-features
     echo "MSRV {{msrv}} check passed"
 
-# Check for semver violations
+# Check for semver violations (skipped for unpublished crates)
 semver:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Checking semver compliance..."
     if ! command -v cargo-semver-checks &> /dev/null; then
         echo "cargo-semver-checks not installed (cargo install cargo-semver-checks)"
+        exit 0
+    fi
+    # Check if crate is published on crates.io
+    CRATE_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+    if ! cargo search "$CRATE_NAME" 2>/dev/null | grep -q "^$CRATE_NAME "; then
+        echo "Crate '$CRATE_NAME' not yet published - skipping semver check (first release)"
         exit 0
     fi
     cargo semver-checks check-release
