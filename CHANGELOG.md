@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migrated connection pooling from `bb8` to `mssql-driver-pool` v0.3.0
   - Integrated pooling designed specifically for mssql-client
   - Simplified connection management with Arc<Pool> pattern
+- **BREAKING**: MSRV bumped from 1.85 to 1.88 (required by rmcp dependency)
 - Updated Azure SDK dependencies to v0.25 for Azure AD authentication
 - Updated `deny.toml` with additional approved licenses (OpenSSL, Zlib, CDLA-Permissive-2.0)
 

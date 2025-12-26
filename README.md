@@ -48,7 +48,7 @@ Browse database metadata via MCP resources:
 
 ### Prerequisites
 
-- Rust 1.85 or later (see `rust-version` in Cargo.toml)
+- Rust 1.88 or later (see `rust-version` in Cargo.toml)
 - SQL Server 2016 or later (including Azure SQL Database)
 
 ### Build from Source

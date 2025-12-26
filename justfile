@@ -9,8 +9,8 @@
 version := `cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version'`
 
 # Minimum Supported Rust Version (must match rust-version in Cargo.toml)
-# 1.85 required for rmcp dependency (uses Rust edition 2024)
-msrv := "1.85"
+# 1.88 required for rmcp dependency (darling 0.23.0 requires rustc 1.88+)
+msrv := "1.88"
 
 # =============================================================================
 # Core Development Commands
