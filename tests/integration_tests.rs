@@ -22,13 +22,12 @@
 //!
 //! Note: SQL Server container requires ~2GB RAM and takes 30-60 seconds to start.
 
+use futures_util::TryStreamExt;
+use mssql_client::{Client, Config, Credentials, Ready};
 use serial_test::serial;
 use std::time::Duration;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::mssql_server::MssqlServer;
-use tiberius::{Client, Config};
-use tokio::net::TcpStream;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 /// Default SA password for testcontainers.
 const DEFAULT_SA_PASSWORD: &str = "yourStrong(!)Password";
@@ -160,20 +159,15 @@ impl TestDatabase {
         &self.version
     }
 
-    /// Create a tiberius client connected to the test database.
-    async fn connect(&self) -> Client<tokio_util::compat::Compat<TcpStream>> {
-        let mut config = Config::new();
-        config.host(&self.host);
-        config.port(self.port);
-        config.authentication(tiberius::AuthMethod::sql_server("sa", &self.password));
-        config.trust_cert();
+    /// Create a mssql-client Client connected to the test database.
+    async fn connect(&self) -> Client<Ready> {
+        let config = Config::new()
+            .host(self.host.clone())
+            .port(self.port)
+            .credentials(Credentials::sql_server("sa", self.password.clone()))
+            .trust_server_certificate(true);
 
-        let tcp = TcpStream::connect(format!("{}:{}", self.host, self.port))
-            .await
-            .expect("Failed to connect to TCP");
-        tcp.set_nodelay(true).expect("Failed to set TCP_NODELAY");
-
-        Client::connect(config, tcp.compat_write())
+        Client::connect(config)
             .await
             .expect("Failed to connect to SQL Server")
     }
@@ -198,18 +192,16 @@ mod connection_tests {
 
         // Simple connectivity test
         let stream = client
-            .simple_query("SELECT 1 AS test")
+            .query("SELECT 1 AS test", &[])
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed to get results");
-        assert!(!results.is_empty(), "Expected at least one result set");
+        let results: Vec<mssql_client::Row> =
+            stream.try_collect().await.expect("Failed to get results");
+        assert!(!results.is_empty(), "Expected at least one row");
 
-        let first_set = &results[0];
-        assert_eq!(first_set.len(), 1, "Expected one row");
-
-        let value: i32 = first_set[0].get(0).expect("Failed to get column value");
-        assert_eq!(value, 1);
+        let value: Option<i32> = results[0].try_get(0);
+        assert_eq!(value, Some(1));
     }
 
     #[tokio::test]
@@ -220,15 +212,19 @@ mod connection_tests {
         let mut client = container.connect().await;
 
         let stream = client
-            .simple_query("SELECT @@VERSION")
+            .query("SELECT @@VERSION", &[])
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed to get results");
-        let version: &str = results[0][0].get(0).expect("Failed to get version");
+        let results: Vec<mssql_client::Row> =
+            stream.try_collect().await.expect("Failed to get results");
+        let version: Option<String> = results[0].try_get(0);
 
         assert!(
-            version.contains("Microsoft SQL Server"),
+            version
+                .as_ref()
+                .map(|v| v.contains("Microsoft SQL Server"))
+                .unwrap_or(false),
             "Version should mention SQL Server"
         );
     }
@@ -250,18 +246,19 @@ mod query_tests {
 
         // Test basic SELECT with multiple columns
         let stream = client
-            .simple_query("SELECT 1 AS num, 'hello' AS text, GETDATE() AS ts")
+            .query("SELECT 1 AS num, 'hello' AS text, GETDATE() AS ts", &[])
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed to get results");
-        assert_eq!(results[0].len(), 1);
+        let results: Vec<mssql_client::Row> =
+            stream.try_collect().await.expect("Failed to get results");
+        assert_eq!(results.len(), 1);
 
-        let num: i32 = results[0][0].get(0).expect("Failed to get num");
-        let text: &str = results[0][0].get(1).expect("Failed to get text");
+        let num: Option<i32> = results[0].try_get(0);
+        let text: Option<String> = results[0].try_get(1);
 
-        assert_eq!(num, 1);
-        assert_eq!(text, "hello");
+        assert_eq!(num, Some(1));
+        assert_eq!(text, Some("hello".to_string()));
     }
 
     #[tokio::test]
@@ -273,44 +270,41 @@ mod query_tests {
 
         // Create a test table
         client
-            .simple_query(
+            .execute(
                 "CREATE TABLE #test_table (
                     id INT PRIMARY KEY,
                     name NVARCHAR(100),
                     value DECIMAL(10,2)
                 )",
+                &[],
             )
             .await
-            .expect("Create table failed")
-            .into_results()
-            .await
-            .expect("Failed to get results");
+            .expect("Create table failed");
 
         // Insert test data
         client
-            .simple_query(
+            .execute(
                 "INSERT INTO #test_table (id, name, value) VALUES
                 (1, N'Alice', 100.50),
                 (2, N'Bob', 200.75),
                 (3, N'Charlie', 300.00)",
+                &[],
             )
             .await
-            .expect("Insert failed")
-            .into_results()
-            .await
-            .expect("Failed to get results");
+            .expect("Insert failed");
 
         // Query the data
         let stream = client
-            .simple_query("SELECT id, name, value FROM #test_table ORDER BY id")
+            .query("SELECT id, name, value FROM #test_table ORDER BY id", &[])
             .await
             .expect("Select failed");
 
-        let results = stream.into_results().await.expect("Failed to get results");
-        assert_eq!(results[0].len(), 3, "Expected 3 rows");
+        let results: Vec<mssql_client::Row> =
+            stream.try_collect().await.expect("Failed to get results");
+        assert_eq!(results.len(), 3, "Expected 3 rows");
 
-        let first_name: &str = results[0][0].get(1).expect("Failed to get name");
-        assert_eq!(first_name, "Alice");
+        let first_name: Option<String> = results[0].try_get(1);
+        assert_eq!(first_name, Some("Alice".to_string()));
     }
 
     #[tokio::test]
@@ -321,17 +315,18 @@ mod query_tests {
         let mut client = container.connect().await;
 
         let stream = client
-            .simple_query("SELECT NULL AS null_col, 'not null' AS text_col")
+            .query("SELECT NULL AS null_col, 'not null' AS text_col", &[])
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed to get results");
+        let results: Vec<mssql_client::Row> =
+            stream.try_collect().await.expect("Failed to get results");
 
-        let null_val: Option<&str> = results[0][0].get(0);
-        let text_val: Option<&str> = results[0][0].get(1);
+        let null_val: Option<String> = results[0].try_get(0);
+        let text_val: Option<String> = results[0].try_get(1);
 
         assert!(null_val.is_none(), "Expected NULL");
-        assert_eq!(text_val, Some("not null"));
+        assert_eq!(text_val, Some("not null".to_string()));
     }
 
     #[tokio::test]
@@ -342,7 +337,7 @@ mod query_tests {
         let mut client = container.connect().await;
 
         let stream = client
-            .simple_query(
+            .query(
                 "SELECT
                     CAST(42 AS INT) AS int_val,
                     CAST(1.2345 AS FLOAT) AS float_val,
@@ -350,24 +345,28 @@ mod query_tests {
                     CAST('2024-01-15' AS DATE) AS date_val,
                     CAST(1 AS BIT) AS bit_val,
                     N'Unicode: ' AS nvarchar_val",
+                &[],
             )
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed to get results");
-        assert_eq!(results[0].len(), 1);
+        let results: Vec<mssql_client::Row> =
+            stream.try_collect().await.expect("Failed to get results");
+        assert_eq!(results.len(), 1);
 
         // Verify int
-        let int_val: i32 = results[0][0].get(0).expect("Failed to get int");
-        assert_eq!(int_val, 42);
+        let int_val: Option<i32> = results[0].try_get(0);
+        assert_eq!(int_val, Some(42));
 
         // Verify float
-        let float_val: f64 = results[0][0].get(1).expect("Failed to get float");
-        assert!((float_val - 1.2345).abs() < 0.0001);
+        let float_val: Option<f64> = results[0].try_get(1);
+        assert!(float_val
+            .map(|v| (v - 1.2345).abs() < 0.0001)
+            .unwrap_or(false));
 
         // Verify bit
-        let bit_val: bool = results[0][0].get(4).expect("Failed to get bit");
-        assert!(bit_val);
+        let bit_val: Option<bool> = results[0].try_get(4);
+        assert_eq!(bit_val, Some(true));
     }
 }
 
@@ -387,51 +386,39 @@ mod transaction_tests {
 
         // Create table
         client
-            .simple_query("CREATE TABLE #tx_test (id INT PRIMARY KEY, value INT)")
+            .execute("CREATE TABLE #tx_test (id INT PRIMARY KEY, value INT)", &[])
             .await
-            .expect("Create table failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Create table failed");
 
         // Begin transaction
         client
-            .simple_query("BEGIN TRANSACTION")
+            .execute("BEGIN TRANSACTION", &[])
             .await
-            .expect("Begin failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Begin failed");
 
         // Insert data
         client
-            .simple_query("INSERT INTO #tx_test VALUES (1, 100)")
+            .execute("INSERT INTO #tx_test VALUES (1, 100)", &[])
             .await
-            .expect("Insert failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Insert failed");
 
         // Commit
         client
-            .simple_query("COMMIT TRANSACTION")
+            .execute("COMMIT TRANSACTION", &[])
             .await
-            .expect("Commit failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Commit failed");
 
         // Verify data persisted
         let stream = client
-            .simple_query("SELECT value FROM #tx_test WHERE id = 1")
+            .query("SELECT value FROM #tx_test WHERE id = 1", &[])
             .await
             .expect("Select failed");
 
-        let results = stream.into_results().await.expect("Failed");
-        assert_eq!(results[0].len(), 1);
+        let results: Vec<mssql_client::Row> = stream.try_collect().await.expect("Failed");
+        assert_eq!(results.len(), 1);
 
-        let value: i32 = results[0][0].get(0).expect("Failed");
-        assert_eq!(value, 100);
+        let value: Option<i32> = results[0].try_get(0);
+        assert_eq!(value, Some(100));
     }
 
     #[tokio::test]
@@ -443,52 +430,45 @@ mod transaction_tests {
 
         // Create table with initial data
         client
-            .simple_query(
-                "CREATE TABLE #rollback_test (id INT PRIMARY KEY, value INT);
-                 INSERT INTO #rollback_test VALUES (1, 100);",
+            .execute(
+                "CREATE TABLE #rollback_test (id INT PRIMARY KEY, value INT)",
+                &[],
             )
             .await
-            .expect("Setup failed")
-            .into_results()
+            .expect("Create failed");
+
+        client
+            .execute("INSERT INTO #rollback_test VALUES (1, 100)", &[])
             .await
-            .expect("Failed");
+            .expect("Insert failed");
 
         // Begin transaction
         client
-            .simple_query("BEGIN TRANSACTION")
+            .execute("BEGIN TRANSACTION", &[])
             .await
-            .expect("Begin failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Begin failed");
 
         // Update data
         client
-            .simple_query("UPDATE #rollback_test SET value = 999 WHERE id = 1")
+            .execute("UPDATE #rollback_test SET value = 999 WHERE id = 1", &[])
             .await
-            .expect("Update failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Update failed");
 
         // Rollback
         client
-            .simple_query("ROLLBACK TRANSACTION")
+            .execute("ROLLBACK TRANSACTION", &[])
             .await
-            .expect("Rollback failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Rollback failed");
 
         // Verify data was rolled back
         let stream = client
-            .simple_query("SELECT value FROM #rollback_test WHERE id = 1")
+            .query("SELECT value FROM #rollback_test WHERE id = 1", &[])
             .await
             .expect("Select failed");
 
-        let results = stream.into_results().await.expect("Failed");
-        let value: i32 = results[0][0].get(0).expect("Failed");
-        assert_eq!(value, 100, "Value should be unchanged after rollback");
+        let results: Vec<mssql_client::Row> = stream.try_collect().await.expect("Failed");
+        let value: Option<i32> = results[0].try_get(0);
+        assert_eq!(value, Some(100), "Value should be unchanged after rollback");
     }
 }
 
@@ -507,21 +487,27 @@ mod metadata_tests {
         let mut client = container.connect().await;
 
         let stream = client
-            .simple_query("SELECT name FROM sys.databases ORDER BY name")
+            .query("SELECT name FROM sys.databases ORDER BY name", &[])
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed");
-        assert!(!results[0].is_empty(), "Should have at least one database");
+        let results: Vec<mssql_client::Row> = stream.try_collect().await.expect("Failed");
+        assert!(!results.is_empty(), "Should have at least one database");
 
         // Check for system databases
-        let db_names: Vec<&str> = results[0]
+        let db_names: Vec<String> = results
             .iter()
-            .filter_map(|row| row.get::<&str, _>(0))
+            .filter_map(|row| row.try_get::<String>(0))
             .collect();
 
-        assert!(db_names.contains(&"master"), "Should have master database");
-        assert!(db_names.contains(&"tempdb"), "Should have tempdb database");
+        assert!(
+            db_names.iter().any(|n| n == "master"),
+            "Should have master database"
+        );
+        assert!(
+            db_names.iter().any(|n| n == "tempdb"),
+            "Should have tempdb database"
+        );
     }
 
     #[tokio::test]
@@ -532,19 +518,20 @@ mod metadata_tests {
         let mut client = container.connect().await;
 
         let stream = client
-            .simple_query(
+            .query(
                 "SELECT TABLE_SCHEMA, TABLE_NAME
                  FROM INFORMATION_SCHEMA.TABLES
                  WHERE TABLE_TYPE = 'BASE TABLE'
                  ORDER BY TABLE_SCHEMA, TABLE_NAME",
+                &[],
             )
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed");
+        let results: Vec<mssql_client::Row> = stream.try_collect().await.expect("Failed");
         // master database has some system tables
         assert!(
-            !results[0].is_empty(),
+            !results.is_empty(),
             "Should have at least some system tables"
         );
     }
@@ -558,22 +545,20 @@ mod metadata_tests {
 
         // Create a test table
         client
-            .simple_query(
+            .execute(
                 "CREATE TABLE #meta_test (
                     id INT NOT NULL PRIMARY KEY,
                     name NVARCHAR(100) NULL,
                     created_at DATETIME2 DEFAULT GETDATE()
                 )",
+                &[],
             )
             .await
-            .expect("Create failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Create failed");
 
         // Query column metadata
         let stream = client
-            .simple_query(
+            .query(
                 "SELECT
                     COLUMN_NAME,
                     DATA_TYPE,
@@ -582,15 +567,16 @@ mod metadata_tests {
                  FROM tempdb.INFORMATION_SCHEMA.COLUMNS
                  WHERE TABLE_NAME LIKE '#meta_test%'
                  ORDER BY ORDINAL_POSITION",
+                &[],
             )
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed");
-        assert_eq!(results[0].len(), 3, "Should have 3 columns");
+        let results: Vec<mssql_client::Row> = stream.try_collect().await.expect("Failed");
+        assert_eq!(results.len(), 3, "Should have 3 columns");
 
-        let first_col_name: &str = results[0][0].get(0).expect("Failed");
-        assert_eq!(first_col_name, "id");
+        let first_col_name: Option<String> = results[0].try_get(0);
+        assert_eq!(first_col_name, Some("id".to_string()));
     }
 }
 
@@ -608,10 +594,10 @@ mod error_tests {
         let container = TestContainer::new().await;
         let mut client = container.connect().await;
 
-        let result = client.simple_query("SELEC invalid syntax").await;
+        let result = client.query("SELEC invalid syntax", &[]).await;
 
         assert!(result.is_err(), "Invalid SQL should return error");
-        let err = result.unwrap_err();
+        let err = result.err().expect("Expected error");
         assert!(
             err.to_string().contains("Incorrect syntax")
                 || err.to_string().contains("could not find")
@@ -629,11 +615,11 @@ mod error_tests {
         let mut client = container.connect().await;
 
         let result = client
-            .simple_query("SELECT * FROM nonexistent_table_xyz")
+            .query("SELECT * FROM nonexistent_table_xyz", &[])
             .await;
 
         assert!(result.is_err(), "Query on non-existent table should fail");
-        let err = result.unwrap_err();
+        let err = result.err().expect("Expected error");
         assert!(
             err.to_string().contains("Invalid object name")
                 || err.to_string().contains("does not exist"),
@@ -651,27 +637,21 @@ mod error_tests {
 
         // Create table with primary key
         client
-            .simple_query("CREATE TABLE #pk_test (id INT PRIMARY KEY)")
+            .execute("CREATE TABLE #pk_test (id INT PRIMARY KEY)", &[])
             .await
-            .expect("Create failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Create failed");
 
         // Insert first row
         client
-            .simple_query("INSERT INTO #pk_test VALUES (1)")
+            .execute("INSERT INTO #pk_test VALUES (1)", &[])
             .await
-            .expect("First insert failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("First insert failed");
 
         // Try to insert duplicate key
-        let result = client.simple_query("INSERT INTO #pk_test VALUES (1)").await;
+        let result = client.execute("INSERT INTO #pk_test VALUES (1)", &[]).await;
 
         assert!(result.is_err(), "Duplicate key insert should fail");
-        let err = result.unwrap_err();
+        let err = result.expect_err("Expected error");
         assert!(
             err.to_string().contains("PRIMARY KEY")
                 || err.to_string().contains("duplicate")
@@ -698,12 +678,9 @@ mod performance_tests {
 
         // Create table
         client
-            .simple_query("CREATE TABLE #bulk_test (id INT, value VARCHAR(100))")
+            .execute("CREATE TABLE #bulk_test (id INT, value VARCHAR(100))", &[])
             .await
-            .expect("Create failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Create failed");
 
         // Build bulk insert statement
         let mut values = Vec::new();
@@ -713,22 +690,19 @@ mod performance_tests {
         let insert_sql = format!("INSERT INTO #bulk_test VALUES {}", values.join(","));
 
         client
-            .simple_query(&insert_sql)
+            .execute(&insert_sql, &[])
             .await
-            .expect("Bulk insert failed")
-            .into_results()
-            .await
-            .expect("Failed");
+            .expect("Bulk insert failed");
 
         // Verify count
         let stream = client
-            .simple_query("SELECT COUNT(*) FROM #bulk_test")
+            .query("SELECT COUNT(*) FROM #bulk_test", &[])
             .await
             .expect("Count failed");
 
-        let results = stream.into_results().await.expect("Failed");
-        let count: i32 = results[0][0].get(0).expect("Failed");
-        assert_eq!(count, 100, "Should have inserted 100 rows");
+        let results: Vec<mssql_client::Row> = stream.try_collect().await.expect("Failed");
+        let count: Option<i32> = results[0].try_get(0);
+        assert_eq!(count, Some(100), "Should have inserted 100 rows");
     }
 
     #[tokio::test]
@@ -740,7 +714,7 @@ mod performance_tests {
 
         // Generate a large result set using recursive CTE
         let stream = client
-            .simple_query(
+            .query(
                 "WITH nums AS (
                     SELECT 1 AS n
                     UNION ALL
@@ -748,11 +722,12 @@ mod performance_tests {
                 )
                 SELECT n FROM nums
                 OPTION (MAXRECURSION 500)",
+                &[],
             )
             .await
             .expect("Query failed");
 
-        let results = stream.into_results().await.expect("Failed");
-        assert_eq!(results[0].len(), 500, "Should have 500 rows");
+        let results: Vec<mssql_client::Row> = stream.try_collect().await.expect("Failed");
+        assert_eq!(results.len(), 500, "Should have 500 rows");
     }
 }

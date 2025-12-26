@@ -4,6 +4,7 @@ use crate::database::types::SqlValue;
 use crate::database::{ConnectionPool, QueryExecutor, QueryResult, ResultRow};
 use crate::error::McpError;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Database metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +131,7 @@ pub struct MetadataQueries {
 
 impl MetadataQueries {
     /// Create a new metadata query builder.
-    pub fn new(pool: ConnectionPool, max_rows: usize) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, max_rows: usize) -> Self {
         Self {
             executor: QueryExecutor::new(pool, max_rows),
         }
@@ -138,7 +139,7 @@ impl MetadataQueries {
 
     /// Get server information.
     pub async fn get_server_info(&self) -> Result<ServerInfo, McpError> {
-        // Note: SERVERPROPERTY() returns sql_variant which tiberius doesn't support.
+        // Note: SERVERPROPERTY() returns sql_variant which needs explicit casting.
         // We must cast all SERVERPROPERTY results to explicit types.
         let query = r#"
             SELECT

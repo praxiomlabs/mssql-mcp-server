@@ -32,25 +32,17 @@ opentelemetry-otlp = { version = "0.27", optional = true, features = ["metrics",
 tracing-opentelemetry = { version = "0.28", optional = true }
 
 # Azure AD Authentication (optional)
-azure_identity = { version = "0.21", optional = true }
-azure_core = { version = "0.21", optional = true }
+# Note: mssql-client uses azure_identity 0.25 when azure-identity feature is enabled
+azure_identity = { version = "0.25", optional = true }
+azure_core = { version = "0.25", optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# SQL Server connectivity via TDS protocol
-tiberius = { version = "0.12", default-features = false, features = [
-    "tds73",
-    "chrono",
-    "rust_decimal",
-    "rustls",
-] }
-
-# Connection pooling
-bb8 = "0.9"
-
-# Async TCP for Tiberius
-tokio-util = { version = "0.7", features = ["compat"] }
+# SQL Server connectivity - modern TDS 7.4/8.0 driver with integrated pooling
+# Default features include chrono, uuid, and decimal
+mssql-client = "0.3.0"
+mssql-driver-pool = "0.3.0"
 
 # Futures utilities (for TryStreamExt)
 futures-util = "0.3"

@@ -24,8 +24,8 @@ pub struct MssqlMcpServer {
     /// Thread-safe session state for async queries.
     pub(crate) state: SharedState,
 
-    /// Database connection pool.
-    pub(crate) pool: ConnectionPool,
+    /// Database connection pool (wrapped in Arc for sharing).
+    pub(crate) pool: Arc<ConnectionPool>,
 
     /// Configuration.
     pub(crate) config: Arc<Config>,
@@ -60,8 +60,8 @@ impl MssqlMcpServer {
     /// - Validating the database connection
     /// - Setting up the tool router
     pub async fn new(config: Config) -> Result<Self, McpError> {
-        // Create connection pool
-        let pool = create_pool(&config.database).await?;
+        // Create connection pool (wrapped in Arc for sharing)
+        let pool = Arc::new(create_pool(&config.database).await?);
 
         // Create shared state
         let state = new_shared_state();
@@ -73,15 +73,15 @@ impl MssqlMcpServer {
             s.set_default_timeout(config.query.default_timeout.as_secs());
         }
 
-        // Create query executor
+        // Create query executor (uses Arc<Pool>)
         let executor = Arc::new(QueryExecutor::new(
-            pool.clone(),
+            Arc::clone(&pool),
             config.security.max_result_rows,
         ));
 
-        // Create metadata queries
+        // Create metadata queries (uses Arc<Pool>)
         let metadata = Arc::new(MetadataQueries::new(
-            pool.clone(),
+            Arc::clone(&pool),
             config.security.max_result_rows,
         ));
 
@@ -139,7 +139,7 @@ impl MssqlMcpServer {
     }
 
     /// Get a reference to the connection pool.
-    pub fn pool(&self) -> &ConnectionPool {
+    pub fn pool(&self) -> &Arc<ConnectionPool> {
         &self.pool
     }
 

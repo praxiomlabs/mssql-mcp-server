@@ -361,23 +361,38 @@ impl From<McpError> for ErrorData {
     }
 }
 
-impl From<tiberius::error::Error> for McpError {
-    fn from(e: tiberius::error::Error) -> Self {
-        use tiberius::error::Error;
+impl From<mssql_client::Error> for McpError {
+    fn from(e: mssql_client::Error) -> Self {
+        use mssql_client::Error;
 
         match &e {
-            Error::Server(server_error) => {
-                from_sql_error(server_error.code() as i32, server_error.message())
+            Error::Server {
+                number, message, ..
+            } => from_sql_error(*number, message),
+            Error::Io(_) => McpError::connection(format!("IO error: {}", e)),
+            Error::Tls(_) => McpError::connection(format!("TLS error: {}", e)),
+            Error::Protocol(_) => McpError::connection(format!("Protocol error: {}", e)),
+            Error::Authentication(_) => McpError::auth(e.to_string()),
+            Error::Connection(_) => McpError::connection(e.to_string()),
+            Error::ConnectionClosed => McpError::connection("Connection closed"),
+            Error::ConnectTimeout | Error::ConnectionTimeout | Error::CommandTimeout => {
+                McpError::timeout(0)
             }
-            Error::Io { kind, message } => {
-                McpError::connection(format!("IO error ({:?}): {}", kind, message))
-            }
-            Error::Tls(msg) => McpError::connection(format!("TLS error: {}", msg)),
-            Error::Protocol(msg) => McpError::connection(format!("Protocol error: {}", msg)),
-            Error::Encoding(msg) => McpError::query_error(format!("Encoding error: {}", msg)),
-            Error::Conversion(msg) => McpError::query_error(format!("Conversion error: {}", msg)),
+            Error::Type(_) => McpError::query_error(format!("Type conversion error: {}", e)),
+            Error::Codec(_) => McpError::query_error(format!("Codec error: {}", e)),
+            Error::Query(_) => McpError::query_error(e.to_string()),
+            Error::Transaction(_) => McpError::query_error(format!("Transaction error: {}", e)),
+            Error::Config(_) => McpError::config(e.to_string()),
+            Error::PoolExhausted => McpError::connection("Connection pool exhausted"),
+            Error::Cancelled => McpError::query_error("Query was cancelled"),
             _ => McpError::internal(e.to_string()),
         }
+    }
+}
+
+impl From<mssql_driver_pool::PoolError> for McpError {
+    fn from(e: mssql_driver_pool::PoolError) -> Self {
+        McpError::connection(format!("Pool error: {}", e))
     }
 }
 
@@ -391,15 +406,6 @@ impl From<std::io::ErrorKind> for McpError {
             ErrorKind::NotConnected => McpError::connection("Not connected"),
             ErrorKind::TimedOut => McpError::timeout(0),
             _ => McpError::connection(format!("IO error: {:?}", kind)),
-        }
-    }
-}
-
-impl From<bb8::RunError<tiberius::error::Error>> for McpError {
-    fn from(e: bb8::RunError<tiberius::error::Error>) -> Self {
-        match e {
-            bb8::RunError::User(tiberius_err) => tiberius_err.into(),
-            bb8::RunError::TimedOut => McpError::timeout(0),
         }
     }
 }

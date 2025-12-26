@@ -19,40 +19,8 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Unmaintained crates: only error on workspace crates, warn on transitive
 unmaintained = "workspace"
 
-# Documented advisory ignores with rationale
-ignore = [
-    # -------------------------------------------------------------------------
-    # azure_core 0.21 transitive dependencies
-    # Updating to azure_core 0.30+ requires code changes (breaking API changes)
-    # in src/database/auth.rs. Tracked for future release.
-    # -------------------------------------------------------------------------
-    { id = "RUSTSEC-2024-0384", reason = """
-        `instant` is unmaintained but has no security vulnerabilities.
-        Transitive dependency of azure_core 0.21 via http-types -> futures-lite -> fastrand.
-        Fix requires updating to azure_core 0.30+ which has breaking API changes.
-        Impact: None - timing utility, not security-sensitive.
-    """ },
-
-    { id = "RUSTSEC-2024-0436", reason = """
-        `paste` is unmaintained but has no security vulnerabilities.
-        Transitive dependency of azure_core 0.21.
-        Fix requires updating to azure_core 0.30+ which has breaking API changes.
-        Impact: None - proc-macro crate with no runtime code.
-    """ },
-
-    # -------------------------------------------------------------------------
-    # tiberius 0.12.3 transitive dependency (SQL Server driver)
-    # tiberius 0.12.3 is the latest version - no upstream fix available.
-    # Also appears in dev dependencies via bollard/testcontainers.
-    # -------------------------------------------------------------------------
-    { id = "RUSTSEC-2025-0134", reason = """
-        `rustls-pemfile` 1.x/2.x is unmaintained (project ended).
-        - 1.x: Transitive dependency of tiberius 0.12.3 (prod) for TLS cert loading
-        - 2.x: Transitive dependency of bollard (dev-only via testcontainers)
-        tiberius 0.12.3 is the latest version - no upstream fix available.
-        Impact: Low - no known security vulnerabilities, just unmaintained.
-    """ },
-]
+# No known advisories to ignore after migrating from tiberius to mssql-client
+ignore = []
 
 # =============================================================================
 # Licenses - Only list licenses actually used by dependencies
@@ -61,9 +29,12 @@ ignore = [
 allow = [
     "Apache-2.0",
     "BSD-3-Clause",
+    "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA certificates)
     "ISC",
     "MIT",
+    "OpenSSL",              # aws-lc-sys (TLS crypto library)
     "Unicode-3.0",
+    "Zlib",                 # foldhash (hashmap implementation)
 ]
 confidence-threshold = 0.8
 
@@ -72,12 +43,12 @@ confidence-threshold = 0.8
 # =============================================================================
 [bans]
 # Duplicate crate versions - warn but don't fail
-# Current duplicates caused by tiberius 0.12.3 using older dependencies:
-# - base64: 0.21 (tiberius) vs 0.22 (rmcp, bollard)
-# - thiserror: 1.x (tiberius) vs 2.x (this crate, rmcp)
-# - getrandom: 0.2 (ring via rustls) vs 0.3 (uuid)
-# - windows-sys: version differences in transitive deps
-# These cannot be resolved without tiberius updating upstream.
+# After migrating from tiberius to mssql-client, remaining duplicates are
+# primarily from dev dependencies (testcontainers/bollard):
+# - base64: 0.21 (docker_credential) vs 0.22 (rmcp, bollard, etc.)
+# - darling: 0.21 (serde_with) vs 0.23 (rmcp-macros)
+# - getrandom: version differences in ring/uuid chains
+# These are all in the test/dev dependency chain and don't affect production.
 multiple-versions = "warn"
 wildcards = "warn"
 highlight = "all"

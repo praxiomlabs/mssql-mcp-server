@@ -9,6 +9,7 @@ use crate::config::DatabaseConfig;
 use crate::database::query::{ColumnInfo, QueryResult, ResultRow};
 use crate::database::types::TypeMapper;
 use crate::error::McpError;
+use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -66,18 +67,11 @@ impl TransactionManager {
         };
 
         // Execute as separate statements on the same connection
-        // We must consume the results from simple_query to complete the operation
-        conn.simple_query(&set_isolation)
-            .await
-            .map_err(|e| McpError::query_error(format!("Failed to set isolation level: {}", e)))?
-            .into_results()
+        conn.execute(&set_isolation, &[])
             .await
             .map_err(|e| McpError::query_error(format!("Failed to set isolation level: {}", e)))?;
 
-        conn.simple_query(&begin_tx)
-            .await
-            .map_err(|e| McpError::query_error(format!("Failed to begin transaction: {}", e)))?
-            .into_results()
+        conn.execute(&begin_tx, &[])
             .await
             .map_err(|e| McpError::query_error(format!("Failed to begin transaction: {}", e)))?;
 
@@ -114,14 +108,18 @@ impl TransactionManager {
             truncate_for_log(query, 100)
         );
 
-        // Execute query
+        // Execute query and collect stream
         let stream = conn
             .query(query, &[])
             .await
             .map_err(|e| McpError::query_error(format!("Query execution failed: {}", e)))?;
 
+        let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+            McpError::query_error(format!("Failed to collect query results: {}", e))
+        })?;
+
         // Process results
-        let result = self.process_stream(stream, self.max_rows, start).await?;
+        let result = self.process_rows(rows, self.max_rows, start)?;
 
         debug!(
             "Transaction query completed: {} rows in {} ms",
@@ -151,10 +149,7 @@ impl TransactionManager {
             None => "COMMIT TRANSACTION".to_string(),
         };
 
-        conn.simple_query(&commit_sql)
-            .await
-            .map_err(|e| McpError::query_error(format!("Failed to commit transaction: {}", e)))?
-            .into_results()
+        conn.execute(&commit_sql, &[])
             .await
             .map_err(|e| McpError::query_error(format!("Failed to commit transaction: {}", e)))?;
 
@@ -185,16 +180,9 @@ impl TransactionManager {
             })?;
 
             let rollback_sql = format!("ROLLBACK TRANSACTION [{}]", sp.replace(']', "]]"));
-            conn.simple_query(&rollback_sql)
-                .await
-                .map_err(|e| {
-                    McpError::query_error(format!("Failed to rollback to savepoint: {}", e))
-                })?
-                .into_results()
-                .await
-                .map_err(|e| {
-                    McpError::query_error(format!("Failed to rollback to savepoint: {}", e))
-                })?;
+            conn.execute(&rollback_sql, &[]).await.map_err(|e| {
+                McpError::query_error(format!("Failed to rollback to savepoint: {}", e))
+            })?;
 
             debug!(
                 "Transaction {} rolled back to savepoint {}",
@@ -216,10 +204,7 @@ impl TransactionManager {
             None => "ROLLBACK TRANSACTION".to_string(),
         };
 
-        conn.simple_query(&rollback_sql)
-            .await
-            .map_err(|e| McpError::query_error(format!("Failed to rollback transaction: {}", e)))?
-            .into_results()
+        conn.execute(&rollback_sql, &[])
             .await
             .map_err(|e| McpError::query_error(format!("Failed to rollback transaction: {}", e)))?;
 
@@ -243,57 +228,57 @@ impl TransactionManager {
         connections.len()
     }
 
-    /// Process a query stream into a QueryResult.
-    async fn process_stream(
+    /// Process query result rows into a QueryResult.
+    fn process_rows(
         &self,
-        mut stream: tiberius::QueryStream<'_>,
+        rows: Vec<mssql_client::Row>,
         max_rows: usize,
         start: Instant,
     ) -> Result<QueryResult, McpError> {
-        use futures_util::stream::TryStreamExt;
-
         let mut columns: Vec<ColumnInfo> = Vec::new();
-        let mut rows: Vec<ResultRow> = Vec::new();
-        let rows_affected: u64 = 0;
+        let mut result_rows: Vec<ResultRow> = Vec::new();
         let mut truncated = false;
 
-        while let Some(item) = stream
-            .try_next()
-            .await
-            .map_err(|e| McpError::query_error(e.to_string()))?
-        {
-            match item {
-                tiberius::QueryItem::Metadata(meta) => {
-                    columns = meta
-                        .columns()
-                        .iter()
-                        .map(|col| ColumnInfo {
-                            name: col.name().to_string(),
-                            sql_type: TypeMapper::sql_type_name(col).to_string(),
-                            nullable: true,
-                        })
-                        .collect();
-                }
-                tiberius::QueryItem::Row(row) => {
-                    if rows.len() >= max_rows {
-                        truncated = true;
-                        continue;
-                    }
+        for (idx, row) in rows.into_iter().enumerate() {
+            // Extract column info from the first row
+            if columns.is_empty() {
+                let row_columns = row.columns();
+                for (i, col) in row_columns.iter().enumerate() {
+                    let name = col.name.clone();
+                    let sql_type = if !col.type_name.is_empty() {
+                        col.type_name.clone()
+                    } else {
+                        let sample_value = TypeMapper::extract_column(&row, i);
+                        TypeMapper::sql_type_name_from_value(&sample_value).to_string()
+                    };
 
-                    let mut result_row = ResultRow::new();
-                    for (idx, col) in columns.iter().enumerate() {
-                        let value = TypeMapper::extract_column(&row, idx);
-                        result_row.insert(col.name.clone(), value);
-                    }
-                    rows.push(result_row);
+                    columns.push(ColumnInfo {
+                        name,
+                        sql_type,
+                        nullable: col.nullable,
+                    });
                 }
             }
+
+            // Check row limit
+            if idx >= max_rows {
+                truncated = true;
+                continue;
+            }
+
+            // Extract row data
+            let mut result_row = ResultRow::new();
+            for (col_idx, col) in columns.iter().enumerate() {
+                let value = TypeMapper::extract_column(&row, col_idx);
+                result_row.insert(col.name.clone(), value);
+            }
+            result_rows.push(result_row);
         }
 
         Ok(QueryResult {
             columns,
-            rows,
-            rows_affected,
+            rows: result_rows,
+            rows_affected: 0,
             execution_time_ms: start.elapsed().as_millis() as u64,
             truncated,
         })
@@ -313,13 +298,10 @@ impl TransactionManager {
         for id in orphaned {
             warn!("Cleaning up orphaned transaction connection: {}", id);
             if let Some(mut conn) = connections.remove(&id) {
-                // Try to rollback before dropping - consume results for proper cleanup
-                if let Ok(stream) = conn
-                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-                    .await
-                {
-                    let _ = stream.into_results().await;
-                }
+                // Try to rollback before dropping
+                let _ = conn
+                    .execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", &[])
+                    .await;
             }
         }
     }

@@ -8,35 +8,33 @@
 
 use crate::config::{AuthConfig, DatabaseConfig};
 use crate::error::McpError;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
-use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use mssql_client::{Client, Config, Credentials, Ready};
 use tracing::debug;
 
-/// Type alias for a raw tiberius connection.
-pub type RawConnection = Client<Compat<TcpStream>>;
+/// Type alias for a raw mssql-client connection in Ready state.
+pub type RawConnection = Client<Ready>;
 
 /// SQL Server resource URI for Azure AD token acquisition.
 /// This is the standard resource URI for Azure SQL Database.
-/// Reserved for future Azure AD token refresh implementation.
-#[allow(dead_code)]
+#[cfg(feature = "azure-auth")]
 const AZURE_SQL_RESOURCE: &str = "https://database.windows.net/";
 
-/// Configure tiberius authentication method based on AuthConfig.
+/// Build credentials based on AuthConfig.
 ///
 /// For Azure AD, this acquires a fresh access token using the service principal credentials.
-pub async fn configure_auth(config: &Config, auth: &AuthConfig) -> Result<Config, McpError> {
-    let mut config = config.clone();
-
+pub async fn build_credentials(auth: &AuthConfig) -> Result<Credentials, McpError> {
     match auth {
         AuthConfig::SqlServer { username, password } => {
-            config.authentication(AuthMethod::sql_server(username, password));
-            Ok(config)
+            Ok(Credentials::sql_server(username.clone(), password.clone()))
         }
         #[cfg(windows)]
         AuthConfig::Windows => {
-            config.authentication(AuthMethod::Integrated);
-            Ok(config)
+            // Note: Integrated authentication requires the 'integrated-auth' feature
+            // on mssql-client, which is platform-specific
+            Err(McpError::config(
+                "Windows integrated authentication requires platform-specific setup. \
+                 Consider using SQL Server or Azure AD authentication.",
+            ))
         }
         AuthConfig::AzureAd {
             client_id,
@@ -46,8 +44,7 @@ pub async fn configure_auth(config: &Config, auth: &AuthConfig) -> Result<Config
             #[cfg(feature = "azure-auth")]
             {
                 let token = acquire_azure_ad_token(client_id, client_secret, tenant_id).await?;
-                config.authentication(AuthMethod::aad_token(token));
-                Ok(config)
+                Ok(Credentials::azure_token(token))
             }
             #[cfg(not(feature = "azure-auth"))]
             {
@@ -69,7 +66,7 @@ async fn acquire_azure_ad_token(
     client_secret: &str,
     tenant_id: &str,
 ) -> Result<String, McpError> {
-    use azure_core::auth::TokenCredential;
+    use azure_core::credentials::{Secret, TokenCredential};
     use azure_identity::ClientSecretCredential;
 
     debug!(
@@ -77,28 +74,19 @@ async fn acquire_azure_ad_token(
         &client_id[..8.min(client_id.len())]
     );
 
-    // Authority host for Azure AD
-    let authority_host: azure_core::Url =
-        format!("https://login.microsoftonline.com/{}", tenant_id)
-            .parse()
-            .map_err(|e| McpError::Authentication(format!("Invalid tenant ID URL: {}", e)))?;
-
-    // Create HTTP client for token requests
-    let http_client = azure_core::new_http_client();
-
-    // Create the client secret credential
+    // Create the client secret credential with the modern API
     let credential = ClientSecretCredential::new(
-        http_client,
-        authority_host,
-        tenant_id.to_string(),
+        tenant_id,
         client_id.to_string(),
-        client_secret.to_string(),
-    );
+        Secret::new(client_secret.to_string()),
+        None, // Use default options
+    )
+    .map_err(|e| McpError::Authentication(format!("Failed to create credential: {}", e)))?;
 
     // Request token for Azure SQL Database resource
     // The scope for Azure SQL is the resource URL with /.default suffix
     let token_response = credential
-        .get_token(&[AZURE_SQL_RESOURCE])
+        .get_token(&[AZURE_SQL_RESOURCE], None)
         .await
         .map_err(|e| {
             McpError::Authentication(format!("Failed to acquire Azure AD token: {}", e))
@@ -108,56 +96,61 @@ async fn acquire_azure_ad_token(
     Ok(token_response.token.secret().to_string())
 }
 
-/// Create a tiberius Config from DatabaseConfig.
+/// Create a mssql-client Config from DatabaseConfig.
 ///
-/// This sets up the basic connection configuration (host, port, database, encryption)
-/// but does NOT configure authentication - use `configure_auth` for that.
-pub fn create_base_config(db_config: &DatabaseConfig) -> Config {
-    let mut config = Config::new();
+/// This sets up the connection configuration including host, port, database,
+/// encryption settings, and authentication credentials.
+pub async fn create_config(db_config: &DatabaseConfig) -> Result<Config, McpError> {
+    let credentials = build_credentials(&db_config.auth).await?;
 
-    // Set host and port
-    config.host(&db_config.host);
-    config.port(db_config.port);
+    let mut config = Config::new()
+        .host(&db_config.host)
+        .port(db_config.port)
+        .credentials(credentials)
+        .application_name(&db_config.application_name)
+        .trust_server_certificate(db_config.trust_server_certificate)
+        .encrypt(db_config.encrypt);
 
     // Set database if specified
     if let Some(ref database) = db_config.database {
-        config.database(database);
+        config = config.database(database);
     }
 
-    // Configure encryption
-    if db_config.encrypt {
-        config.encryption(EncryptionLevel::Required);
-    } else {
-        config.encryption(EncryptionLevel::Off);
-    }
-
-    // Trust server certificate if requested
-    if db_config.trust_server_certificate {
-        config.trust_cert();
-    }
-
-    // Set application name
-    config.application_name(&db_config.application_name);
-
-    config
+    Ok(config)
 }
 
-/// Create a tiberius Config with a custom application name suffix.
+/// Create a mssql-client Config with a custom application name suffix.
 ///
 /// This is useful for distinguishing different connection types in SQL Server logs.
-pub fn create_base_config_with_suffix(db_config: &DatabaseConfig, suffix: &str) -> Config {
-    let mut config = create_base_config(db_config);
-    config.application_name(format!("{}-{}", db_config.application_name, suffix));
-    config
+pub async fn create_config_with_suffix(
+    db_config: &DatabaseConfig,
+    suffix: &str,
+) -> Result<Config, McpError> {
+    let credentials = build_credentials(&db_config.auth).await?;
+
+    let app_name = format!("{}-{}", db_config.application_name, suffix);
+
+    let mut config = Config::new()
+        .host(&db_config.host)
+        .port(db_config.port)
+        .credentials(credentials)
+        .application_name(&app_name)
+        .trust_server_certificate(db_config.trust_server_certificate)
+        .encrypt(db_config.encrypt);
+
+    // Set database if specified
+    if let Some(ref database) = db_config.database {
+        config = config.database(database);
+    }
+
+    Ok(config)
 }
 
 /// Create a raw connection to SQL Server.
 ///
 /// This is a convenience function that handles the full connection flow:
-/// 1. Creates base configuration
-/// 2. Configures authentication (including Azure AD token acquisition if needed)
-/// 3. Establishes TCP connection
-/// 4. Performs TDS handshake
+/// 1. Creates configuration with authentication
+/// 2. Establishes connection to SQL Server
 ///
 /// # Arguments
 /// * `db_config` - Database configuration including auth settings
@@ -166,28 +159,17 @@ pub async fn create_connection(
     db_config: &DatabaseConfig,
     app_name_suffix: Option<&str>,
 ) -> Result<RawConnection, McpError> {
-    // Create base config with optional suffix
-    let base_config = match app_name_suffix {
-        Some(suffix) => create_base_config_with_suffix(db_config, suffix),
-        None => create_base_config(db_config),
+    // Create config with optional suffix
+    let config = match app_name_suffix {
+        Some(suffix) => create_config_with_suffix(db_config, suffix).await?,
+        None => create_config(db_config).await?,
     };
 
-    // Configure authentication (may acquire Azure AD token)
-    let config = configure_auth(&base_config, &db_config.auth).await?;
-
-    // Establish TCP connection
+    // Establish connection
     let address = format!("{}:{}", db_config.host, db_config.port);
     debug!("Creating connection to {}", address);
 
-    let tcp = TcpStream::connect(&address)
-        .await
-        .map_err(|e| McpError::connection(format!("Failed to connect to {}: {}", address, e)))?;
-
-    tcp.set_nodelay(true)
-        .map_err(|e| McpError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
-
-    // Perform TDS handshake
-    let client = Client::connect(config, tcp.compat_write())
+    let client = Client::connect(config)
         .await
         .map_err(|e| McpError::connection(format!("Failed to connect to SQL Server: {}", e)))?;
 
@@ -227,18 +209,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_base_config() {
-        let db_config = test_db_config();
-        let _config = create_base_config(&db_config);
-        // Config doesn't expose getters, so we just verify it doesn't panic
+    #[tokio::test]
+    async fn test_build_credentials() {
+        let auth = AuthConfig::SqlServer {
+            username: "sa".to_string(),
+            password: "test".to_string(),
+        };
+        let creds = build_credentials(&auth).await;
+        assert!(creds.is_ok());
     }
 
-    #[test]
-    fn test_create_base_config_with_suffix() {
+    #[tokio::test]
+    async fn test_create_config() {
         let db_config = test_db_config();
-        let _config = create_base_config_with_suffix(&db_config, "session");
-        // Config doesn't expose getters, so we just verify it doesn't panic
+        let config = create_config(&db_config).await;
+        assert!(config.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_config_with_suffix() {
+        let db_config = test_db_config();
+        let config = create_config_with_suffix(&db_config, "session").await;
+        assert!(config.is_ok());
     }
 
     #[test]

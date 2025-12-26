@@ -1,9 +1,9 @@
 //! SQL Server type mapping to Rust types.
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use mssql_client::Row;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tiberius::Row;
 use uuid::Uuid;
 
 /// A SQL value that can be serialized to JSON.
@@ -61,117 +61,104 @@ impl SqlValue {
 pub struct TypeMapper;
 
 impl TypeMapper {
-    /// Extract a value from a Tiberius row column.
+    /// Extract a value from a row column.
+    ///
+    /// This method attempts to extract values by trying different types
+    /// in order of likelihood, returning the first successful conversion.
+    /// The try_get method returns None if the value is NULL or if the type
+    /// conversion fails.
     pub fn extract_column(row: &Row, idx: usize) -> SqlValue {
-        let col = row.columns().get(idx);
-        if col.is_none() {
+        // Check if the column is null first
+        if row.is_null(idx) {
             return SqlValue::Null;
         }
 
         // Try each type in order of likelihood
         // Strings (most common)
-        if let Some(v) = row.try_get::<&str, _>(idx).ok().flatten() {
-            return SqlValue::String(v.to_string());
+        if let Some(v) = row.try_get::<String>(idx) {
+            return SqlValue::String(v);
         }
 
         // Integers
-        if let Some(v) = row.try_get::<i32, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<i32>(idx) {
             return SqlValue::I32(v);
         }
-        if let Some(v) = row.try_get::<i64, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<i64>(idx) {
             return SqlValue::I64(v);
         }
-        if let Some(v) = row.try_get::<i16, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<i16>(idx) {
             return SqlValue::I16(v);
         }
-        // Note: i8/TINYINT is handled as u8 in tiberius
-        if let Some(v) = row.try_get::<u8, _>(idx).ok().flatten() {
+        // Note: i8/TINYINT is typically handled as u8
+        if let Some(v) = row.try_get::<u8>(idx) {
             return SqlValue::I8(v as i8);
         }
 
         // Floating point
-        if let Some(v) = row.try_get::<f64, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<f64>(idx) {
             return SqlValue::F64(v);
         }
-        if let Some(v) = row.try_get::<f32, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<f32>(idx) {
             return SqlValue::F32(v);
         }
 
         // Decimal
-        if let Some(v) = row.try_get::<Decimal, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<Decimal>(idx) {
             return SqlValue::Decimal(v);
         }
 
         // Boolean
-        if let Some(v) = row.try_get::<bool, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<bool>(idx) {
             return SqlValue::Bool(v);
         }
 
         // UUID
-        if let Some(v) = row.try_get::<Uuid, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<Uuid>(idx) {
             return SqlValue::Uuid(v);
         }
 
         // Date/Time types
-        if let Some(v) = row.try_get::<NaiveDateTime, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<NaiveDateTime>(idx) {
             return SqlValue::DateTime(v);
         }
-        if let Some(v) = row.try_get::<NaiveDate, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<NaiveDate>(idx) {
             return SqlValue::Date(v);
         }
-        if let Some(v) = row.try_get::<NaiveTime, _>(idx).ok().flatten() {
+        if let Some(v) = row.try_get::<NaiveTime>(idx) {
             return SqlValue::Time(v);
         }
 
         // Binary
-        if let Some(v) = row.try_get::<&[u8], _>(idx).ok().flatten() {
-            return SqlValue::Bytes(v.to_vec());
+        if let Some(v) = row.try_get::<Vec<u8>>(idx) {
+            return SqlValue::Bytes(v);
         }
 
         // Fall back to NULL for unsupported types
         SqlValue::Null
     }
 
-    /// Get the SQL type name for a column.
-    pub fn sql_type_name(col: &tiberius::Column) -> &'static str {
-        use tiberius::ColumnType;
-
-        match col.column_type() {
-            ColumnType::Null => "NULL",
-            ColumnType::Int1 => "TINYINT",
-            ColumnType::Int2 => "SMALLINT",
-            ColumnType::Int4 => "INT",
-            ColumnType::Int8 => "BIGINT",
-            ColumnType::Float4 => "REAL",
-            ColumnType::Float8 => "FLOAT",
-            ColumnType::Money => "MONEY",
-            ColumnType::Money4 => "SMALLMONEY",
-            ColumnType::Datetime => "DATETIME",
-            ColumnType::Datetime4 => "SMALLDATETIME",
-            ColumnType::Bit => "BIT",
-            ColumnType::Guid => "UNIQUEIDENTIFIER",
-            ColumnType::Decimaln => "DECIMAL",
-            ColumnType::Numericn => "NUMERIC",
-            ColumnType::Bitn => "BIT",
-            ColumnType::Intn => "INT",
-            ColumnType::Floatn => "FLOAT",
-            ColumnType::Datetimen => "DATETIME",
-            ColumnType::Daten => "DATE",
-            ColumnType::Timen => "TIME",
-            ColumnType::Datetime2 => "DATETIME2",
-            ColumnType::DatetimeOffsetn => "DATETIMEOFFSET",
-            ColumnType::BigVarBin => "VARBINARY",
-            ColumnType::BigVarChar => "VARCHAR",
-            ColumnType::BigBinary => "BINARY",
-            ColumnType::BigChar => "CHAR",
-            ColumnType::NVarchar => "NVARCHAR",
-            ColumnType::NChar => "NCHAR",
-            ColumnType::Xml => "XML",
-            ColumnType::Text => "TEXT",
-            ColumnType::Image => "IMAGE",
-            ColumnType::NText => "NTEXT",
-            ColumnType::SSVariant => "SQL_VARIANT",
-            _ => "UNKNOWN",
+    /// Get the SQL type name for a column based on the value.
+    ///
+    /// Note: This is a best-effort type detection based on the extracted value.
+    /// For precise type information, query the column metadata from SQL Server.
+    pub fn sql_type_name_from_value(value: &SqlValue) -> &'static str {
+        match value {
+            SqlValue::Null => "NULL",
+            SqlValue::Bool(_) => "BIT",
+            SqlValue::I8(_) => "TINYINT",
+            SqlValue::I16(_) => "SMALLINT",
+            SqlValue::I32(_) => "INT",
+            SqlValue::I64(_) => "BIGINT",
+            SqlValue::F32(_) => "REAL",
+            SqlValue::F64(_) => "FLOAT",
+            SqlValue::String(_) => "NVARCHAR",
+            SqlValue::Bytes(_) => "VARBINARY",
+            SqlValue::Decimal(_) => "DECIMAL",
+            SqlValue::Uuid(_) => "UNIQUEIDENTIFIER",
+            SqlValue::Date(_) => "DATE",
+            SqlValue::Time(_) => "TIME",
+            SqlValue::DateTime(_) => "DATETIME2",
+            SqlValue::DateTimeUtc(_) => "DATETIMEOFFSET",
         }
     }
 }
@@ -208,5 +195,21 @@ mod tests {
     fn test_hex_encode() {
         assert_eq!(hex::encode(&[0xDE, 0xAD, 0xBE, 0xEF]), "DEADBEEF");
         assert_eq!(hex::encode(&[]), "");
+    }
+
+    #[test]
+    fn test_sql_type_name_from_value() {
+        assert_eq!(
+            TypeMapper::sql_type_name_from_value(&SqlValue::Null),
+            "NULL"
+        );
+        assert_eq!(
+            TypeMapper::sql_type_name_from_value(&SqlValue::I32(42)),
+            "INT"
+        );
+        assert_eq!(
+            TypeMapper::sql_type_name_from_value(&SqlValue::String("test".to_string())),
+            "NVARCHAR"
+        );
     }
 }

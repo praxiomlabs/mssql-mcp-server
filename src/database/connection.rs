@@ -1,126 +1,16 @@
 //! Connection pool management for SQL Server.
 
-use super::auth::{configure_auth, create_base_config};
-use crate::config::{AuthConfig, DatabaseConfig};
+use super::auth::create_config;
+use crate::config::DatabaseConfig;
 use crate::error::McpError;
-use bb8::{Pool, PooledConnection};
-use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
-use tiberius::{Client, Config};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use tracing::{debug, info, warn};
+use mssql_driver_pool::{Pool, PoolBuilder, PooledConnection};
+use tracing::{debug, info};
 
 /// Type alias for the connection pool.
-pub type ConnectionPool = Pool<ConnectionManager>;
+pub type ConnectionPool = Pool;
 
 /// Type alias for a pooled connection.
-pub type PooledConn<'a> = PooledConnection<'a, ConnectionManager>;
-
-/// Connection manager for bb8 pool.
-#[derive(Clone)]
-pub struct ConnectionManager {
-    /// Base configuration (without auth - auth is configured per connection for Azure AD)
-    base_config: Arc<Config>,
-    /// Auth configuration for token refresh
-    auth_config: Arc<AuthConfig>,
-    host: String,
-    port: u16,
-}
-
-impl ConnectionManager {
-    /// Create a new connection manager from database configuration.
-    ///
-    /// Note: For Azure AD authentication, the token is acquired fresh for each
-    /// new connection to handle token expiration properly.
-    pub fn new(db_config: &DatabaseConfig) -> Result<Self, McpError> {
-        let base_config = create_base_config(db_config);
-
-        Ok(Self {
-            base_config: Arc::new(base_config),
-            auth_config: Arc::new(db_config.auth.clone()),
-            host: db_config.host.clone(),
-            port: db_config.port,
-        })
-    }
-
-    /// Get the connection address.
-    fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-}
-
-impl bb8::ManageConnection for ConnectionManager {
-    type Connection = Client<Compat<TcpStream>>;
-    type Error = tiberius::error::Error;
-
-    fn connect(&self) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        let base_config = self.base_config.clone();
-        let auth_config = self.auth_config.clone();
-        let address = self.address();
-
-        async move {
-            debug!("Creating new database connection to {}", address);
-
-            // Configure authentication (acquires fresh Azure AD token if needed)
-            let config = configure_auth(&base_config, &auth_config)
-                .await
-                .map_err(|e| {
-                    // Convert McpError to tiberius error for bb8 compatibility
-                    tiberius::error::Error::Protocol(e.to_string().into())
-                })?;
-
-            let tcp = TcpStream::connect(&address).await?;
-            tcp.set_nodelay(true)?;
-
-            let client = Client::connect(config, tcp.compat_write()).await?;
-
-            debug!("Database connection established");
-            Ok(client)
-        }
-    }
-
-    fn is_valid(
-        &self,
-        conn: &mut Self::Connection,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        // Validate connection with a lightweight query
-        // Use a 5 second timeout to prevent hanging on dead connections
-        const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
-
-        let query_future = conn.simple_query("SELECT 1");
-        async move {
-            match timeout(VALIDATION_TIMEOUT, async {
-                // Execute validation query and consume results
-                let stream = query_future.await?;
-                let _ = stream.into_results().await?;
-                Ok::<_, tiberius::error::Error>(())
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    warn!(
-                        "Connection validation timed out after {:?}",
-                        VALIDATION_TIMEOUT
-                    );
-                    Err(tiberius::error::Error::Protocol(
-                        "Connection validation timeout".into(),
-                    ))
-                }
-            }
-        }
-    }
-
-    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        // Tiberius doesn't provide a way to check if connection is broken
-        // without executing a query, so we return false here and rely on
-        // is_valid for actual validation
-        false
-    }
-}
+pub type PooledConn = PooledConnection;
 
 /// Create a connection pool from configuration.
 pub async fn create_pool(config: &DatabaseConfig) -> Result<ConnectionPool, McpError> {
@@ -129,14 +19,18 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<ConnectionPool, McpE
         config.host, config.port, config.pool.min_connections, config.pool.max_connections
     );
 
-    let manager = ConnectionManager::new(config)?;
+    // Create base configuration
+    let client_config = create_config(config).await?;
 
-    let pool = Pool::builder()
-        .min_idle(Some(config.pool.min_connections))
-        .max_size(config.pool.max_connections)
+    // Build the pool with settings from our config
+    let pool = PoolBuilder::new()
+        .client_config(client_config)
+        .min_connections(config.pool.min_connections)
+        .max_connections(config.pool.max_connections)
+        .idle_timeout(config.pool.idle_timeout)
         .connection_timeout(config.pool.connection_timeout)
-        .idle_timeout(Some(config.pool.idle_timeout))
-        .build(manager)
+        .sp_reset_connection(true) // Enable connection state cleanup
+        .build()
         .await
         .map_err(|e| McpError::connection_with_source("Failed to create connection pool", e))?;
 
@@ -145,17 +39,42 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<ConnectionPool, McpE
         let _conn = pool.get().await.map_err(|e| {
             McpError::connection(format!("Failed to establish initial connection: {}", e))
         })?;
-        // Connection dropped here, releasing borrow
+        debug!("Initial connection test successful");
+        // Connection dropped here, releasing borrow and returning to pool
     }
 
     info!("Connection pool created successfully");
     Ok(pool)
 }
 
+/// Get pool health status.
+pub fn pool_status(pool: &ConnectionPool) -> PoolStatus {
+    let status = pool.status();
+    PoolStatus {
+        total_connections: status.total as usize,
+        available_connections: status.available as usize,
+        in_use_connections: status.in_use as usize,
+        max_connections: status.max as usize,
+    }
+}
+
+/// Pool status information.
+#[derive(Debug, Clone)]
+pub struct PoolStatus {
+    /// Total number of connections in the pool.
+    pub total_connections: usize,
+    /// Number of connections available for checkout.
+    pub available_connections: usize,
+    /// Number of connections currently in use.
+    pub in_use_connections: usize,
+    /// Maximum allowed connections.
+    pub max_connections: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PoolConfig;
+    use crate::config::{AuthConfig, PoolConfig};
 
     fn test_config() -> DatabaseConfig {
         DatabaseConfig {
@@ -174,16 +93,10 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_manager_creation() {
+    fn test_pool_config() {
         let config = test_config();
-        let manager = ConnectionManager::new(&config);
-        assert!(manager.is_ok());
-    }
-
-    #[test]
-    fn test_connection_address() {
-        let config = test_config();
-        let manager = ConnectionManager::new(&config).unwrap();
-        assert_eq!(manager.address(), "localhost:1433");
+        // Just verify config creation doesn't panic
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.port, 1433);
     }
 }

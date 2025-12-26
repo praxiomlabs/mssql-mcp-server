@@ -3,10 +3,11 @@
 use crate::database::types::{SqlValue, TypeMapper};
 use crate::database::ConnectionPool;
 use crate::error::McpError;
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tiberius::QueryStream;
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -185,13 +186,13 @@ impl QueryResult {
 
 /// Query executor for running SQL queries.
 pub struct QueryExecutor {
-    pool: ConnectionPool,
+    pool: Arc<ConnectionPool>,
     max_rows: usize,
 }
 
 impl QueryExecutor {
     /// Create a new query executor.
-    pub fn new(pool: ConnectionPool, max_rows: usize) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, max_rows: usize) -> Self {
         Self { pool, max_rows }
     }
 
@@ -240,9 +241,21 @@ impl QueryExecutor {
 
         // Wrap execution in timeout if specified
         let execution_future = async {
-            let mut conn = self.pool.get().await?;
-            let stream = conn.query(query, &[]).await?;
-            self.process_stream(stream, max_rows, start).await
+            let mut conn = self.pool.get().await.map_err(|e| {
+                McpError::connection(format!("Failed to get connection from pool: {}", e))
+            })?;
+
+            let stream = conn
+                .query(query, &[])
+                .await
+                .map_err(|e| McpError::query_error(format!("Query execution failed: {}", e)))?;
+
+            // Collect stream to Vec
+            let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+                McpError::query_error(format!("Failed to collect query results: {}", e))
+            })?;
+
+            self.process_rows(rows, max_rows, start)
         };
 
         let result = if let Some(secs) = timeout_seconds {
@@ -269,12 +282,15 @@ impl QueryExecutor {
 
         debug!("Executing non-query: {}", truncate_for_log(query, 200));
 
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.pool.get().await.map_err(|e| {
+            McpError::connection(format!("Failed to get connection from pool: {}", e))
+        })?;
 
-        // Execute query
-        let result = conn.execute(query, &[]).await?;
-
-        let rows_affected = result.rows_affected().iter().sum();
+        // Execute query - returns rows affected directly as u64
+        let rows_affected = conn
+            .execute(query, &[])
+            .await
+            .map_err(|e| McpError::query_error(format!("Non-query execution failed: {}", e)))?;
 
         debug!("Non-query completed: {} rows affected", rows_affected);
 
@@ -287,31 +303,31 @@ impl QueryExecutor {
         })
     }
 
-    /// Execute a raw SQL statement using simple_query.
+    /// Execute a raw SQL statement.
     ///
     /// This is required for DDL statements that must be the only/first statement
     /// in a batch, such as CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION, and
-    /// CREATE TRIGGER. The regular `query()` method uses sp_executesql which
-    /// creates its own batch context, breaking these requirements.
-    ///
-    /// This method sends raw SQL text directly without parameterization.
+    /// CREATE TRIGGER.
     pub async fn execute_raw(&self, query: &str) -> Result<QueryResult, McpError> {
         let start = Instant::now();
 
         debug!("Executing raw query: {}", truncate_for_log(query, 200));
 
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.pool.get().await.map_err(|e| {
+            McpError::connection(format!("Failed to get connection from pool: {}", e))
+        })?;
 
-        // Use simple_query which sends raw SQL without sp_executesql wrapper
-        let results = conn
-            .simple_query(query)
+        // Execute raw SQL
+        let stream = conn
+            .query(query, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Raw query failed: {}", e)))?
-            .into_results()
-            .await
-            .map_err(|e| McpError::query_error(format!("Failed to get results: {}", e)))?;
+            .map_err(|e| McpError::query_error(format!("Raw query failed: {}", e)))?;
 
-        let result = self.convert_simple_query_results(results, start);
+        let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+            McpError::query_error(format!("Failed to collect raw query results: {}", e))
+        })?;
+
+        let result = self.process_rows(rows, self.max_rows, start)?;
 
         debug!(
             "Raw query completed: {} rows in {} ms",
@@ -369,7 +385,9 @@ impl QueryExecutor {
             truncate_for_log(query, 200)
         );
 
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.pool.get().await.map_err(|e| {
+            McpError::connection(format!("Failed to get connection from pool: {}", e))
+        })?;
 
         // Determine which SET statements to use based on plan type
         let (set_on, set_off) = match plan_type.to_lowercase().as_str() {
@@ -381,40 +399,25 @@ impl QueryExecutor {
         };
 
         // For estimated plans, we need to execute SET SHOWPLAN separately
-        // because SQL Server requires it to be the only statement in the batch
         if plan_type.to_lowercase() != "actual" {
-            // Execute SET SHOWPLAN_ALL ON as its own batch - must consume results
-            conn.simple_query(set_on)
-                .await
-                .map_err(|e| McpError::query_error(format!("Failed to enable SHOWPLAN: {}", e)))?
-                .into_results()
+            // Execute SET SHOWPLAN_ALL ON as its own batch
+            conn.execute(set_on, &[])
                 .await
                 .map_err(|e| McpError::query_error(format!("Failed to enable SHOWPLAN: {}", e)))?;
 
-            // Execute the query using simple_query - with SHOWPLAN ON, this returns
-            // the execution plan instead of executing the query. We use simple_query
-            // because SHOWPLAN results come back as regular result sets.
-            let results = conn
-                .simple_query(query)
-                .await
-                .map_err(|e| McpError::query_error(format!("Failed to get execution plan: {}", e)))?
-                .into_results()
-                .await
-                .map_err(|e| {
-                    McpError::query_error(format!("Failed to get execution plan: {}", e))
-                })?;
+            // Execute the query - with SHOWPLAN ON, this returns the execution plan
+            let stream = conn.query(query, &[]).await.map_err(|e| {
+                McpError::query_error(format!("Failed to get execution plan: {}", e))
+            })?;
 
-            // Turn off SHOWPLAN (best effort - if this fails, the connection will be invalid
-            // but bb8 will handle that on next use)
-            if let Ok(stream) = conn.simple_query(set_off).await {
-                let _ = stream.into_results().await;
-            }
+            let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+                McpError::query_error(format!("Failed to collect execution plan: {}", e))
+            })?;
 
-            // Convert the results to our QueryResult format
-            // SHOWPLAN_ALL returns columns: StmtText, StmtId, NodeId, Parent, PhysicalOp,
-            // LogicalOp, Argument, DefinedValues, EstimateRows, EstimateIO, EstimateCPU,
-            // AvgRowSize, TotalSubtreeCost, OutputList, Warnings, Type, Parallel, EstimateExecutions
-            let result = self.convert_simple_query_results(results, start);
+            // Turn off SHOWPLAN (best effort)
+            let _ = conn.execute(set_off, &[]).await;
+
+            let result = self.process_rows(rows, self.max_rows, start)?;
 
             debug!(
                 "Showplan query completed: {} rows in {} ms",
@@ -431,7 +434,11 @@ impl QueryExecutor {
                 McpError::query_error(format!("Failed to execute with statistics: {}", e))
             })?;
 
-            let result = self.process_stream(stream, self.max_rows, start).await?;
+            let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+                McpError::query_error(format!("Failed to collect statistics results: {}", e))
+            })?;
+
+            let result = self.process_rows(rows, self.max_rows, start)?;
 
             debug!(
                 "Statistics query completed: {} rows in {} ms",
@@ -443,111 +450,63 @@ impl QueryExecutor {
         }
     }
 
-    /// Process a query stream into a QueryResult.
-    async fn process_stream(
+    /// Process query result rows into a QueryResult.
+    fn process_rows(
         &self,
-        mut stream: QueryStream<'_>,
+        rows: Vec<mssql_client::Row>,
         max_rows: usize,
         start: Instant,
     ) -> Result<QueryResult, McpError> {
-        use futures_util::stream::TryStreamExt;
-
         let mut columns: Vec<ColumnInfo> = Vec::new();
-        let mut rows: Vec<ResultRow> = Vec::new();
-        let rows_affected: u64 = 0;
+        let mut result_rows: Vec<ResultRow> = Vec::new();
         let mut truncated = false;
 
-        // Process result sets
-        while let Some(item) = stream.try_next().await? {
-            match item {
-                tiberius::QueryItem::Metadata(meta) => {
-                    // Extract column information
-                    columns = meta
-                        .columns()
-                        .iter()
-                        .map(|col| ColumnInfo {
-                            name: col.name().to_string(),
-                            sql_type: TypeMapper::sql_type_name(col).to_string(),
-                            // Tiberius doesn't expose nullable info at the column type level
-                            // Default to true (nullable) for safety
-                            nullable: true,
-                        })
-                        .collect();
-                }
-                tiberius::QueryItem::Row(row) => {
-                    if rows.len() >= max_rows {
-                        truncated = true;
-                        // Skip remaining rows but continue to get rows_affected
-                        continue;
-                    }
+        for (idx, row) in rows.into_iter().enumerate() {
+            // Extract column info from the first row
+            if columns.is_empty() {
+                let row_columns = row.columns();
+                for (i, col) in row_columns.iter().enumerate() {
+                    // Get column name from metadata
+                    let name = col.name.clone();
 
-                    let mut result_row = ResultRow::new();
-                    for (idx, col) in columns.iter().enumerate() {
-                        let value = TypeMapper::extract_column(&row, idx);
-                        result_row.insert(col.name.clone(), value);
-                    }
-                    rows.push(result_row);
+                    // Use type info from column metadata if available, otherwise infer from value
+                    let sql_type = if !col.type_name.is_empty() {
+                        col.type_name.clone()
+                    } else {
+                        let sample_value = TypeMapper::extract_column(&row, i);
+                        TypeMapper::sql_type_name_from_value(&sample_value).to_string()
+                    };
+
+                    columns.push(ColumnInfo {
+                        name,
+                        sql_type,
+                        nullable: col.nullable,
+                    });
                 }
             }
-        }
 
-        // Note: rows_affected is only available for execute() calls, not query()
-        // For SELECT queries, rows_affected stays at 0
+            // Check row limit
+            if idx >= max_rows {
+                truncated = true;
+                continue;
+            }
+
+            // Extract row data
+            let mut result_row = ResultRow::new();
+            for (col_idx, col) in columns.iter().enumerate() {
+                let value = TypeMapper::extract_column(&row, col_idx);
+                result_row.insert(col.name.clone(), value);
+            }
+            result_rows.push(result_row);
+        }
 
         Ok(QueryResult {
             columns,
-            rows,
-            rows_affected,
+            rows: result_rows,
+            rows_affected: 0,
             execution_time_ms: start.elapsed().as_millis() as u64,
             truncated,
         })
-    }
-
-    /// Convert results from simple_query().into_results() to our QueryResult format.
-    ///
-    /// This is used for SHOWPLAN queries where we need to use simple_query instead
-    /// of the parameterized query method.
-    fn convert_simple_query_results(
-        &self,
-        results: Vec<Vec<tiberius::Row>>,
-        start: Instant,
-    ) -> QueryResult {
-        let mut columns: Vec<ColumnInfo> = Vec::new();
-        let mut rows: Vec<ResultRow> = Vec::new();
-
-        for result_set in results {
-            // Process each row in the result set
-            for row in result_set {
-                // Extract column info from the first row if we haven't yet
-                if columns.is_empty() {
-                    columns = row
-                        .columns()
-                        .iter()
-                        .map(|col| ColumnInfo {
-                            name: col.name().to_string(),
-                            sql_type: TypeMapper::sql_type_name(col).to_string(),
-                            nullable: true,
-                        })
-                        .collect();
-                }
-
-                // Extract row data
-                let mut result_row = ResultRow::new();
-                for (idx, col) in columns.iter().enumerate() {
-                    let value = TypeMapper::extract_column(&row, idx);
-                    result_row.insert(col.name.clone(), value);
-                }
-                rows.push(result_row);
-            }
-        }
-
-        QueryResult {
-            columns,
-            rows,
-            rows_affected: 0,
-            execution_time_ms: start.elapsed().as_millis() as u64,
-            truncated: false,
-        }
     }
 
     /// Execute a multi-batch query, splitting on GO separators.
@@ -568,7 +527,9 @@ impl QueryExecutor {
         let mut combined_rows: Vec<ResultRow> = Vec::new();
         let mut batch_num = 0;
 
-        let mut conn = self.pool.get().await?;
+        let mut conn = self.pool.get().await.map_err(|e| {
+            McpError::connection(format!("Failed to get connection from pool: {}", e))
+        })?;
 
         for batch in batches {
             let trimmed = batch.trim();
@@ -583,44 +544,53 @@ impl QueryExecutor {
                 truncate_for_log(trimmed, 100)
             );
 
-            // Use simple_query for each batch so DDL works correctly
-            let results = conn
-                .simple_query(trimmed)
-                .await
-                .map_err(|e| McpError::query_error(format!("Batch {} failed: {}", batch_num, e)))?
-                .into_results()
+            // Execute each batch and collect results
+            let stream = conn
+                .query(trimmed, &[])
                 .await
                 .map_err(|e| McpError::query_error(format!("Batch {} failed: {}", batch_num, e)))?;
 
+            let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+                McpError::query_error(format!(
+                    "Batch {} result collection failed: {}",
+                    batch_num, e
+                ))
+            })?;
+
             // Process results from this batch
-            for result_set in results {
-                for row in result_set {
-                    // Extract column info from the first row if we haven't yet
-                    if combined_columns.is_empty() {
-                        combined_columns = row
-                            .columns()
-                            .iter()
-                            .map(|col| ColumnInfo {
-                                name: col.name().to_string(),
-                                sql_type: TypeMapper::sql_type_name(col).to_string(),
-                                nullable: true,
-                            })
-                            .collect();
-                    }
+            for row in rows {
+                // Extract column info from the first row if we haven't yet
+                if combined_columns.is_empty() {
+                    let row_columns = row.columns();
+                    for (i, col) in row_columns.iter().enumerate() {
+                        let name = col.name.clone();
+                        let sql_type = if !col.type_name.is_empty() {
+                            col.type_name.clone()
+                        } else {
+                            let sample_value = TypeMapper::extract_column(&row, i);
+                            TypeMapper::sql_type_name_from_value(&sample_value).to_string()
+                        };
 
-                    // Check row limit
-                    if combined_rows.len() >= self.max_rows {
-                        continue;
+                        combined_columns.push(ColumnInfo {
+                            name,
+                            sql_type,
+                            nullable: col.nullable,
+                        });
                     }
-
-                    // Extract row data
-                    let mut result_row = ResultRow::new();
-                    for (idx, col) in combined_columns.iter().enumerate() {
-                        let value = TypeMapper::extract_column(&row, idx);
-                        result_row.insert(col.name.clone(), value);
-                    }
-                    combined_rows.push(result_row);
                 }
+
+                // Check row limit
+                if combined_rows.len() >= self.max_rows {
+                    continue;
+                }
+
+                // Extract row data
+                let mut result_row = ResultRow::new();
+                for (idx, col) in combined_columns.iter().enumerate() {
+                    let value = TypeMapper::extract_column(&row, idx);
+                    result_row.insert(col.name.clone(), value);
+                }
+                combined_rows.push(result_row);
             }
         }
 
@@ -859,5 +829,53 @@ mod tests {
             truncate_for_log("this is a long string", 10),
             "this is a ..."
         );
+    }
+
+    #[test]
+    fn test_split_on_go() {
+        let script = "SELECT 1\nGO\nSELECT 2";
+        let batches = split_on_go(script);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], "SELECT 1");
+        assert_eq!(batches[1], "SELECT 2");
+    }
+
+    #[test]
+    fn test_split_on_go_repeat() {
+        let script = "INSERT INTO t VALUES (1)\nGO 3";
+        let batches = split_on_go(script);
+        assert_eq!(batches.len(), 3);
+    }
+
+    #[test]
+    fn test_requires_raw_execution() {
+        assert!(QueryExecutor::requires_raw_execution(
+            "CREATE VIEW v AS SELECT 1"
+        ));
+        assert!(QueryExecutor::requires_raw_execution(
+            "  CREATE PROCEDURE p AS BEGIN SELECT 1 END"
+        ));
+        assert!(QueryExecutor::requires_raw_execution(
+            "-- comment\nCREATE FUNCTION f() RETURNS INT AS BEGIN RETURN 1 END"
+        ));
+        assert!(!QueryExecutor::requires_raw_execution(
+            "SELECT * FROM sys.tables"
+        ));
+        assert!(!QueryExecutor::requires_raw_execution(
+            "INSERT INTO t VALUES (1)"
+        ));
+    }
+
+    #[test]
+    fn test_contains_go_separator() {
+        assert!(QueryExecutor::contains_go_separator(
+            "SELECT 1\nGO\nSELECT 2"
+        ));
+        assert!(QueryExecutor::contains_go_separator(
+            "SELECT 1\n  GO  \nSELECT 2"
+        ));
+        assert!(QueryExecutor::contains_go_separator("SELECT 1\nGO 5"));
+        assert!(!QueryExecutor::contains_go_separator("SELECT 1; SELECT 2"));
+        assert!(!QueryExecutor::contains_go_separator("SELECT 'GO' AS word"));
     }
 }

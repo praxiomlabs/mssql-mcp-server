@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING**: Migrated SQL Server driver from `tiberius` to `mssql-client` v0.3.0
+  - Resolves dependency conflicts with duplicate crate versions
+  - Improved type support including proper handling of all MAX/LOB types
+  - Better DATE, XML, SQL_VARIANT, and high-precision DECIMAL support
+- Migrated connection pooling from `bb8` to `mssql-driver-pool` v0.3.0
+  - Integrated pooling designed specifically for mssql-client
+  - Simplified connection management with Arc<Pool> pattern
+- Updated Azure SDK dependencies to v0.25 for Azure AD authentication
+- Updated `deny.toml` with additional approved licenses (OpenSSL, Zlib, CDLA-Permissive-2.0)
+
+### Fixed
+- Connection pool now properly wrapped in Arc for thread-safe sharing
+- Row column access updated from Result<Option<T>> to Option<T> pattern
+- QueryStream collection using TryStreamExt::try_collect()
+
 ## [0.1.0] - 2025-12-18
 
 ### Added
@@ -14,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Core Features
 - Initial MCP server implementation using the rmcp SDK
 - Full MCP protocol compliance with stdio transport
-- Comprehensive SQL Server connectivity via TDS protocol (tiberius)
-- Connection pooling with bb8 for high-performance concurrent access
+- Comprehensive SQL Server connectivity via TDS protocol (mssql-client)
+- Connection pooling with mssql-driver-pool for high-performance concurrent access
 
 #### Tools
 - `execute_query` - Execute read-only SQL queries with result limiting

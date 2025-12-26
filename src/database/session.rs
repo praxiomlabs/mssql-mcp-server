@@ -10,6 +10,7 @@ use crate::config::DatabaseConfig;
 use crate::database::query::{ColumnInfo, QueryResult, ResultRow};
 use crate::database::types::TypeMapper;
 use crate::error::McpError;
+use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,17 +126,18 @@ impl SessionManager {
             truncate_for_log(query, 100)
         );
 
-        // Execute query using simple_query for full flexibility (supports all SQL)
-        let results = conn
-            .simple_query(query)
+        // Execute query and collect stream
+        let stream = conn
+            .query(query, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Query execution failed: {}", e)))?
-            .into_results()
-            .await
-            .map_err(|e| McpError::query_error(format!("Failed to get results: {}", e)))?;
+            .map_err(|e| McpError::query_error(format!("Query execution failed: {}", e)))?;
+
+        let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+            McpError::query_error(format!("Failed to collect query results: {}", e))
+        })?;
 
         // Convert results
-        let result = self.convert_results(results, start);
+        let result = self.process_rows(rows, start);
 
         debug!(
             "Session query completed: {} rows in {} ms",
@@ -155,12 +157,9 @@ impl SessionManager {
 
         // Clean up any temp tables or transactions before closing
         // This is best-effort - we don't fail if cleanup fails
-        if let Ok(stream) = conn
-            .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-            .await
-        {
-            let _ = stream.into_results().await;
-        }
+        let _ = conn
+            .execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", &[])
+            .await;
 
         debug!(
             "Session {} ended after {} queries, connection released",
@@ -216,12 +215,9 @@ impl SessionManager {
                     now.duration_since(info.last_activity)
                 );
                 // Try to clean up before dropping
-                if let Ok(stream) = conn
-                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-                    .await
-                {
-                    let _ = stream.into_results().await;
-                }
+                let _ = conn
+                    .execute("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION", &[])
+                    .await;
                 cleaned.push(id);
             }
         }
@@ -229,46 +225,51 @@ impl SessionManager {
         cleaned
     }
 
-    /// Convert simple_query results to QueryResult.
-    fn convert_results(&self, results: Vec<Vec<tiberius::Row>>, start: Instant) -> QueryResult {
+    /// Process query results to QueryResult.
+    fn process_rows(&self, rows: Vec<mssql_client::Row>, start: Instant) -> QueryResult {
         let mut columns: Vec<ColumnInfo> = Vec::new();
-        let mut rows: Vec<ResultRow> = Vec::new();
+        let mut result_rows: Vec<ResultRow> = Vec::new();
         let mut truncated = false;
 
-        for result_set in results {
-            for row in result_set {
-                // Extract column info from the first row if we haven't yet
-                if columns.is_empty() {
-                    columns = row
-                        .columns()
-                        .iter()
-                        .map(|col| ColumnInfo {
-                            name: col.name().to_string(),
-                            sql_type: TypeMapper::sql_type_name(col).to_string(),
-                            nullable: true,
-                        })
-                        .collect();
-                }
+        for row in rows {
+            // Extract column info from the first row if we haven't yet
+            if columns.is_empty() {
+                let row_columns = row.columns();
+                for (i, col) in row_columns.iter().enumerate() {
+                    let name = col.name.clone();
+                    let sql_type = if !col.type_name.is_empty() {
+                        col.type_name.clone()
+                    } else {
+                        let sample_value = TypeMapper::extract_column(&row, i);
+                        TypeMapper::sql_type_name_from_value(&sample_value).to_string()
+                    };
 
-                // Check row limit
-                if rows.len() >= self.max_rows {
-                    truncated = true;
-                    continue;
+                    columns.push(ColumnInfo {
+                        name,
+                        sql_type,
+                        nullable: col.nullable,
+                    });
                 }
-
-                // Extract row data
-                let mut result_row = ResultRow::new();
-                for (idx, col) in columns.iter().enumerate() {
-                    let value = TypeMapper::extract_column(&row, idx);
-                    result_row.insert(col.name.clone(), value);
-                }
-                rows.push(result_row);
             }
+
+            // Check row limit
+            if result_rows.len() >= self.max_rows {
+                truncated = true;
+                continue;
+            }
+
+            // Extract row data
+            let mut result_row = ResultRow::new();
+            for (idx, col) in columns.iter().enumerate() {
+                let value = TypeMapper::extract_column(&row, idx);
+                result_row.insert(col.name.clone(), value);
+            }
+            result_rows.push(result_row);
         }
 
         QueryResult {
             columns,
-            rows,
+            rows: result_rows,
             rows_affected: 0,
             execution_time_ms: start.elapsed().as_millis() as u64,
             truncated,

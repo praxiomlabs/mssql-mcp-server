@@ -581,10 +581,12 @@ impl MssqlMcpServer {
             }
 
             // Get pool statistics
-            let pool_state = self.pool.state();
+            let pool_status = self.pool.status();
             response["pool"] = json!({
-                "connections": pool_state.connections,
-                "idle_connections": pool_state.idle_connections,
+                "total_connections": pool_status.total,
+                "available_connections": pool_status.available,
+                "in_use_connections": pool_status.in_use,
+                "max_connections": pool_status.max,
             });
 
             // Get session statistics
@@ -2405,7 +2407,7 @@ impl MssqlMcpServer {
 
     /// Get connection pool metrics and statistics.
     ///
-    /// Returns information about the bb8 connection pool including
+    /// Returns information about the connection pool including
     /// active connections, idle connections, and pool configuration.
     #[tool(
         name = "get_pool_metrics",
@@ -2417,19 +2419,16 @@ impl MssqlMcpServer {
     ) -> Result<CallToolResult, ErrorData> {
         debug!("Getting connection pool metrics");
 
-        let pool_state = self.pool.state();
+        let pool_status = self.pool.status();
 
         let mut response = json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "pool": {
-                "total_connections": pool_state.connections,
-                "idle_connections": pool_state.idle_connections,
-                "active_connections": pool_state.connections - pool_state.idle_connections,
-                "utilization_percent": if pool_state.connections > 0 {
-                    ((pool_state.connections - pool_state.idle_connections) as f64 / pool_state.connections as f64) * 100.0
-                } else {
-                    0.0
-                }
+                "total_connections": pool_status.total,
+                "available_connections": pool_status.available,
+                "in_use_connections": pool_status.in_use,
+                "max_connections": pool_status.max,
+                "utilization_percent": pool_status.utilization()
             },
             "config": {
                 "max_connections": self.config.database.pool.max_connections,
@@ -2440,12 +2439,11 @@ impl MssqlMcpServer {
         });
 
         // Add health assessment
-        let healthy = pool_state.idle_connections > 0
-            || pool_state.connections < self.config.database.pool.max_connections;
+        let healthy = pool_status.available > 0 || !pool_status.is_at_capacity();
         response["health"] = json!({
             "status": if healthy { "healthy" } else { "degraded" },
-            "has_idle_connections": pool_state.idle_connections > 0,
-            "at_capacity": pool_state.connections >= self.config.database.pool.max_connections,
+            "has_available_connections": pool_status.available > 0,
+            "at_capacity": pool_status.is_at_capacity(),
         });
 
         if input.include_history {
@@ -2462,9 +2460,8 @@ impl MssqlMcpServer {
         }
 
         info!(
-            "Pool metrics: {}/{} connections active",
-            pool_state.connections - pool_state.idle_connections,
-            pool_state.connections
+            "Pool metrics: {}/{} connections in use",
+            pool_status.in_use, pool_status.total
         );
 
         Ok(CallToolResult::success(vec![Content::text(
