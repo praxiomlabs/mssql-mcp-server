@@ -39,7 +39,7 @@ Browse database metadata via MCP resources:
 
 ### Performance
 
-- **Connection Pooling**: Efficient bb8-based connection pooling
+- **Connection Pooling**: Efficient mssql-driver-pool based connection pooling
 - **Query Caching**: In-memory caching with configurable TTL
 - **Async I/O**: Full async/await support with Tokio runtime
 - **Result Streaming**: Efficient memory usage for large results
@@ -369,7 +369,7 @@ MSSQL_HOST=localhost MSSQL_USER=sa MSSQL_PASSWORD=pass ./mssql-mcp-server
                     │  │   (Caching, Session Management)     │   │
                     │  └─────────────────┬───────────────────┘   │
                     │  ┌─────────────────▼───────────────────┐   │
-                    │  │       Connection Pool (bb8)         │   │
+                    │  │   Connection Pool (mssql-driver-pool)│   │
                     │  │   ┌─────────┐  ┌─────────────────┐  │   │
                     │  │   │  Pool   │  │ Transaction &   │  │   │
                     │  │   │Connects │  │Session Connects │  │   │

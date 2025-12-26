@@ -164,7 +164,7 @@ impl ShutdownController {
 
         // Phase 3: Close connections (pool cleanup is handled by Drop)
         self.notify_phase(ShutdownPhase::ClosingConnections);
-        // Connection pool cleanup happens automatically via bb8's drop
+        // Connection pool cleanup happens automatically via mssql-driver-pool's drop
 
         // Phase 4: Flush caches
         self.notify_phase(ShutdownPhase::FlushingCaches);
