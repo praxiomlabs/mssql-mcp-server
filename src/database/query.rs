@@ -355,11 +355,13 @@ impl QueryExecutor {
             "CREATE PROC",
             "CREATE FUNCTION",
             "CREATE TRIGGER",
+            "CREATE SCHEMA",
             "ALTER VIEW",
             "ALTER PROCEDURE",
             "ALTER PROC",
             "ALTER FUNCTION",
             "ALTER TRIGGER",
+            "ALTER SCHEMA",
         ];
 
         batch_first_patterns
@@ -607,6 +609,120 @@ impl QueryExecutor {
             columns: combined_columns,
             rows: combined_rows,
             rows_affected: 0, // Multi-batch doesn't track rows affected
+            execution_time_ms: start.elapsed().as_millis() as u64,
+            truncated,
+        })
+    }
+
+    /// Execute a multi-batch query with optional database context.
+    ///
+    /// Like execute_multi_batch, but prepends USE [database] to each batch
+    /// to ensure all batches run in the correct database context.
+    pub async fn execute_multi_batch_with_db(
+        &self,
+        script: &str,
+        database: Option<&str>,
+    ) -> Result<QueryResult, ServerError> {
+        let start = Instant::now();
+        let batches = split_on_go(script);
+
+        debug!(
+            "Executing multi-batch query with {} batch(es), database: {:?}",
+            batches.len(),
+            database
+        );
+
+        let mut combined_columns: Vec<ColumnInfo> = Vec::new();
+        let mut combined_rows: Vec<ResultRow> = Vec::new();
+        let mut batch_num = 0;
+
+        let mut conn = self.pool.get().await.map_err(|e| {
+            ServerError::connection(format!("Failed to get connection from pool: {}", e))
+        })?;
+
+        for batch in batches {
+            let trimmed = batch.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            batch_num += 1;
+
+            // Prepend USE [database] to each batch if a database is specified
+            let effective_batch = match database {
+                Some(db) => format!("USE [{}];\n{}", db, trimmed),
+                None => trimmed.to_string(),
+            };
+
+            debug!(
+                "Executing batch {}: {}",
+                batch_num,
+                truncate_for_log(&effective_batch, 100)
+            );
+
+            // Execute each batch and collect results
+            let stream = conn
+                .query(&effective_batch, &[])
+                .await
+                .map_err(|e| ServerError::query_error(format!("Batch {} failed: {}", batch_num, e)))?;
+
+            let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
+                ServerError::query_error(format!(
+                    "Batch {} result collection failed: {}",
+                    batch_num, e
+                ))
+            })?;
+
+            // Process results from this batch
+            for row in rows {
+                // Extract column info from the first row if we haven't yet
+                if combined_columns.is_empty() {
+                    let row_columns = row.columns();
+                    for (i, col) in row_columns.iter().enumerate() {
+                        let name = col.name.clone();
+                        let sql_type = if !col.type_name.is_empty() {
+                            col.type_name.clone()
+                        } else {
+                            let sample_value = TypeMapper::extract_column(&row, i);
+                            TypeMapper::sql_type_name_from_value(&sample_value).to_string()
+                        };
+
+                        combined_columns.push(ColumnInfo {
+                            name,
+                            sql_type,
+                            nullable: col.nullable,
+                        });
+                    }
+                }
+
+                // Check row limit
+                if combined_rows.len() >= self.max_rows {
+                    continue;
+                }
+
+                // Extract row data
+                let mut result_row = ResultRow::new();
+                for (idx, col) in combined_columns.iter().enumerate() {
+                    let value = TypeMapper::extract_column(&row, idx);
+                    result_row.insert(col.name.clone(), value);
+                }
+                combined_rows.push(result_row);
+            }
+        }
+
+        let truncated = combined_rows.len() >= self.max_rows;
+
+        debug!(
+            "Multi-batch query completed: {} batches, {} rows in {} ms",
+            batch_num,
+            combined_rows.len(),
+            start.elapsed().as_millis()
+        );
+
+        Ok(QueryResult {
+            columns: combined_columns,
+            rows: combined_rows,
+            rows_affected: 0,
             execution_time_ms: start.elapsed().as_millis() as u64,
             truncated,
         })

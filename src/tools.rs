@@ -78,16 +78,29 @@ impl MssqlMcpServer {
             return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
+        // Get current database from state (for switch_database support)
+        // Pool connections don't persist database context, so we need to prepend USE
+        let current_db = {
+            let state = self.state.read().await;
+            state.current_database().map(|s| s.to_string())
+        };
+
         // Determine row limit
         let max_rows = input
             .max_rows
             .unwrap_or(self.config.security.max_result_rows);
 
-        // Check if this is a multi-batch query with GO separators
-        // If so, split and execute each batch sequentially
+        // Check execution mode on the ORIGINAL query (before USE prefix)
+        // This ensures pattern detection works correctly for batch-first DDL
         let result = if QueryExecutor::contains_go_separator(&input.query) {
+            // Multi-batch query with GO separators
+            // Pass database context so each batch gets the USE prefix
             debug!("Using multi-batch execution for script with GO separators");
-            match self.executor.execute_multi_batch(&input.query).await {
+            match self
+                .executor
+                .execute_multi_batch_with_db(&input.query, current_db.as_deref())
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Multi-batch execution failed: {}", e);
@@ -95,10 +108,14 @@ impl MssqlMcpServer {
                 }
             }
         } else if QueryExecutor::requires_raw_execution(&input.query) {
-            // Batch-first DDL statements (CREATE VIEW/PROC/FUNC/TRIGGER)
+            // Batch-first DDL statements (CREATE VIEW/PROC/FUNC/TRIGGER/SCHEMA)
             // must be executed using simple_query to avoid sp_executesql wrapper
             debug!("Using raw execution for batch-first DDL statement");
-            match self.executor.execute_raw(&input.query).await {
+            let effective_query = match &current_db {
+                Some(db) => format!("USE [{}];\n{}", db, input.query),
+                None => input.query.clone(),
+            };
+            match self.executor.execute_raw(&effective_query).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Raw query execution failed: {}", e);
@@ -106,11 +123,14 @@ impl MssqlMcpServer {
                 }
             }
         } else {
-            // Execute the query using standard parameterized method
-            // Use execute_with_options to support per-query timeout overrides
+            // Standard execution with optional database context
+            let effective_query = match &current_db {
+                Some(db) => format!("USE [{}];\n{}", db, input.query),
+                None => input.query.clone(),
+            };
             match self
                 .executor
-                .execute_with_options(&input.query, max_rows, input.timeout_seconds)
+                .execute_with_options(&effective_query, max_rows, input.timeout_seconds)
                 .await
             {
                 Ok(r) => r,
