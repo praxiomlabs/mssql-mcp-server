@@ -8,7 +8,7 @@ use super::auth::{create_connection, truncate_for_log, RawConnection};
 use crate::config::DatabaseConfig;
 use crate::database::query::{ColumnInfo, QueryResult, ResultRow};
 use crate::database::types::TypeMapper;
-use crate::error::McpError;
+use crate::error::ServerError;
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ impl TransactionManager {
     }
 
     /// Create a new raw connection using the database configuration.
-    async fn create_txn_connection(&self) -> Result<RawConnection, McpError> {
+    async fn create_txn_connection(&self) -> Result<RawConnection, ServerError> {
         create_connection(&self.db_config, Some("txn")).await
     }
 
@@ -55,7 +55,7 @@ impl TransactionManager {
         transaction_id: &str,
         isolation_level: &str,
         name: Option<&str>,
-    ) -> Result<(), McpError> {
+    ) -> Result<(), ServerError> {
         // Create a dedicated connection for this transaction
         let mut conn = self.create_txn_connection().await?;
 
@@ -69,11 +69,11 @@ impl TransactionManager {
         // Execute as separate statements on the same connection
         conn.execute(&set_isolation, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Failed to set isolation level: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Failed to set isolation level: {}", e)))?;
 
         conn.execute(&begin_tx, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Failed to begin transaction: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Failed to begin transaction: {}", e)))?;
 
         // Store the connection
         let mut connections = self.connections.lock().await;
@@ -91,12 +91,12 @@ impl TransactionManager {
         &self,
         transaction_id: &str,
         query: &str,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         let start = Instant::now();
 
         let mut connections = self.connections.lock().await;
         let conn = connections.get_mut(transaction_id).ok_or_else(|| {
-            McpError::Session(format!(
+            ServerError::Session(format!(
                 "Transaction connection not found: {}",
                 transaction_id
             ))
@@ -112,10 +112,10 @@ impl TransactionManager {
         let stream = conn
             .query(query, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Query execution failed: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Query execution failed: {}", e)))?;
 
         let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
-            McpError::query_error(format!("Failed to collect query results: {}", e))
+            ServerError::query_error(format!("Failed to collect query results: {}", e))
         })?;
 
         // Process results
@@ -135,10 +135,10 @@ impl TransactionManager {
         &self,
         transaction_id: &str,
         name: Option<&str>,
-    ) -> Result<(), McpError> {
+    ) -> Result<(), ServerError> {
         let mut connections = self.connections.lock().await;
         let mut conn = connections.remove(transaction_id).ok_or_else(|| {
-            McpError::Session(format!(
+            ServerError::Session(format!(
                 "Transaction connection not found: {}",
                 transaction_id
             ))
@@ -151,7 +151,7 @@ impl TransactionManager {
 
         conn.execute(&commit_sql, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Failed to commit transaction: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Failed to commit transaction: {}", e)))?;
 
         debug!(
             "Transaction {} committed, connection released",
@@ -167,13 +167,13 @@ impl TransactionManager {
         transaction_id: &str,
         name: Option<&str>,
         savepoint: Option<&str>,
-    ) -> Result<bool, McpError> {
+    ) -> Result<bool, ServerError> {
         let mut connections = self.connections.lock().await;
 
         // For savepoint rollback, we don't remove the connection
         if let Some(sp) = savepoint {
             let conn = connections.get_mut(transaction_id).ok_or_else(|| {
-                McpError::Session(format!(
+                ServerError::Session(format!(
                     "Transaction connection not found: {}",
                     transaction_id
                 ))
@@ -181,7 +181,7 @@ impl TransactionManager {
 
             let rollback_sql = format!("ROLLBACK TRANSACTION [{}]", sp.replace(']', "]]"));
             conn.execute(&rollback_sql, &[]).await.map_err(|e| {
-                McpError::query_error(format!("Failed to rollback to savepoint: {}", e))
+                ServerError::query_error(format!("Failed to rollback to savepoint: {}", e))
             })?;
 
             debug!(
@@ -193,7 +193,7 @@ impl TransactionManager {
 
         // Full rollback - remove and close connection
         let mut conn = connections.remove(transaction_id).ok_or_else(|| {
-            McpError::Session(format!(
+            ServerError::Session(format!(
                 "Transaction connection not found: {}",
                 transaction_id
             ))
@@ -206,7 +206,7 @@ impl TransactionManager {
 
         conn.execute(&rollback_sql, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Failed to rollback transaction: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Failed to rollback transaction: {}", e)))?;
 
         debug!(
             "Transaction {} rolled back, connection released",
@@ -234,7 +234,7 @@ impl TransactionManager {
         rows: Vec<mssql_client::Row>,
         max_rows: usize,
         start: Instant,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         let mut columns: Vec<ColumnInfo> = Vec::new();
         let mut result_rows: Vec<ResultRow> = Vec::new();
         let mut truncated = false;

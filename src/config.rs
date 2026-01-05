@@ -8,7 +8,7 @@ use crate::constants::{
     DEFAULT_CONNECTION_TIMEOUT_SECS, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_ROWS,
     DEFAULT_MIN_CONNECTIONS, DEFAULT_QUERY_TIMEOUT, DEFAULT_QUERY_TIMEOUT_SECS,
 };
-use crate::error::McpError;
+use crate::error::ServerError;
 use crate::security::ValidationMode;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -166,10 +166,10 @@ impl Config {
     /// - `MSSQL_QUERY_TIMEOUT`: Default query timeout in seconds (default: 30)
     /// - `MSSQL_VALIDATION_MODE`: Query validation mode (readonly, standard, unrestricted)
     /// - `MSSQL_MAX_ROWS`: Maximum result rows (default: 10000)
-    pub fn from_env() -> Result<Self, McpError> {
+    pub fn from_env() -> Result<Self, ServerError> {
         // Required: Host
         let host = std::env::var("MSSQL_HOST")
-            .map_err(|_| McpError::config("MSSQL_HOST environment variable is required"))?;
+            .map_err(|_| ServerError::config("MSSQL_HOST environment variable is required"))?;
 
         // Determine authentication type
         let auth_type = std::env::var("MSSQL_AUTH_TYPE")
@@ -180,17 +180,17 @@ impl Config {
             Some("azuread") | Some("azure") | Some("aad") => {
                 // Azure AD Authentication
                 let client_id = std::env::var("MSSQL_AZURE_CLIENT_ID").map_err(|_| {
-                    McpError::config(
+                    ServerError::config(
                         "MSSQL_AZURE_CLIENT_ID is required for Azure AD authentication",
                     )
                 })?;
                 let client_secret = std::env::var("MSSQL_AZURE_CLIENT_SECRET").map_err(|_| {
-                    McpError::config(
+                    ServerError::config(
                         "MSSQL_AZURE_CLIENT_SECRET is required for Azure AD authentication",
                     )
                 })?;
                 let tenant_id = std::env::var("MSSQL_AZURE_TENANT_ID").map_err(|_| {
-                    McpError::config(
+                    ServerError::config(
                         "MSSQL_AZURE_TENANT_ID is required for Azure AD authentication",
                     )
                 })?;
@@ -212,17 +212,17 @@ impl Config {
                         password: p,
                     },
                     (Some(_), None) => {
-                        return Err(McpError::config(
+                        return Err(ServerError::config(
                             "MSSQL_PASSWORD is required when MSSQL_USER is set",
                         ))
                     }
                     (None, Some(_)) => {
-                        return Err(McpError::config(
+                        return Err(ServerError::config(
                             "MSSQL_USER is required when MSSQL_PASSWORD is set",
                         ))
                     }
                     (None, None) => {
-                        return Err(McpError::config(
+                        return Err(ServerError::config(
                             "Authentication required: set MSSQL_USER and MSSQL_PASSWORD, or use MSSQL_AUTH_TYPE=azuread",
                         ))
                     }

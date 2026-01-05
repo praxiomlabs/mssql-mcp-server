@@ -3,12 +3,14 @@
 //! This module defines semantic error types with SQL Server error code mapping
 //! for user-friendly error messages.
 
-use rmcp::ErrorData;
+pub use mcpkit::McpError;
 use thiserror::Error;
 
 /// Domain-specific errors for the MSSQL MCP Server.
+///
+/// Named `ServerError` to avoid collision with `mcpkit::McpError`.
 #[derive(Debug, Error)]
-pub enum McpError {
+pub enum ServerError {
     /// Configuration error
     #[error("Configuration error: {0}")]
     Config(String),
@@ -92,7 +94,7 @@ pub enum McpError {
     Internal(String),
 }
 
-impl McpError {
+impl ServerError {
     /// Create a configuration error.
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Config(msg.into())
@@ -240,58 +242,58 @@ impl McpError {
     }
 }
 
-/// Map SQL Server error codes to semantic McpError types.
-pub fn from_sql_error(code: i32, message: &str) -> McpError {
+/// Map SQL Server error codes to semantic ServerError types.
+pub fn from_sql_error(code: i32, message: &str) -> ServerError {
     match code {
         // Authentication errors
-        18456 => McpError::auth(format!("Login failed: {}", message)),
+        18456 => ServerError::auth(format!("Login failed: {}", message)),
 
         // Database errors
-        4060 => McpError::DatabaseNotFound(message.to_string()),
+        4060 => ServerError::DatabaseNotFound(message.to_string()),
 
         // Object not found errors
-        208 => McpError::object_not_found("Object", message),
-        2812 => McpError::object_not_found("Stored procedure", message),
+        208 => ServerError::object_not_found("Object", message),
+        2812 => ServerError::object_not_found("Stored procedure", message),
 
         // Permission errors
-        229 | 230 => McpError::permission_denied(message),
-        262 => McpError::permission_denied(format!("CREATE permission denied: {}", message)),
+        229 | 230 => ServerError::permission_denied(message),
+        262 => ServerError::permission_denied(format!("CREATE permission denied: {}", message)),
 
         // Timeout
-        -2 => McpError::timeout(0),
+        -2 => ServerError::timeout(0),
 
         // Connection errors
-        -1 => McpError::connection("Connection broken"),
-        53 => McpError::connection("Server not found or not accessible"),
+        -1 => ServerError::connection("Connection broken"),
+        53 => ServerError::connection("Server not found or not accessible"),
 
         // Constraint violations
-        547 => McpError::ConstraintViolation(message.to_string()),
-        2601 | 2627 => McpError::ConstraintViolation(format!("Duplicate key: {}", message)),
+        547 => ServerError::ConstraintViolation(message.to_string()),
+        2601 | 2627 => ServerError::ConstraintViolation(format!("Duplicate key: {}", message)),
 
         // Data errors
-        8115 => McpError::QueryExecution {
+        8115 => ServerError::QueryExecution {
             message: format!("Arithmetic overflow: {}", message),
             sql_error_code: Some(code),
             sql_state: None,
         },
-        8152 => McpError::DataTruncation(message.to_string()),
+        8152 => ServerError::DataTruncation(message.to_string()),
 
         // Syntax errors
-        102 => McpError::query_error_with_code(format!("Syntax error: {}", message), code, None),
+        102 => ServerError::query_error_with_code(format!("Syntax error: {}", message), code, None),
 
         // Invalid column/object
-        207 => McpError::query_error_with_code(format!("Invalid column: {}", message), code, None),
-        201 => McpError::query_error_with_code(format!("Invalid object: {}", message), code, None),
+        207 => ServerError::query_error_with_code(format!("Invalid column: {}", message), code, None),
+        201 => ServerError::query_error_with_code(format!("Invalid object: {}", message), code, None),
 
         // Deadlock
-        1205 => McpError::QueryExecution {
+        1205 => ServerError::QueryExecution {
             message: "Transaction was deadlocked and has been rolled back".to_string(),
             sql_error_code: Some(code),
             sql_state: None,
         },
 
         // Default: generic query error
-        _ => McpError::query_error_with_code(message, code, None),
+        _ => ServerError::query_error_with_code(message, code, None),
     }
 }
 
@@ -314,54 +316,48 @@ fn is_transient_sql_error(code: i32) -> bool {
     )
 }
 
-/// Convert McpError to rmcp's ErrorData for protocol responses.
+/// Convert ServerError to mcpkit's McpError for protocol responses.
 ///
-/// Note: Tool errors should generally return `CallToolResult` with `is_error: true`
+/// Note: Tool errors should generally return `ToolOutput::error()` with a message
 /// instead of using this conversion. This is primarily for protocol-level errors.
-impl From<McpError> for ErrorData {
-    fn from(e: McpError) -> Self {
+impl From<ServerError> for McpError {
+    fn from(e: ServerError) -> Self {
         match e {
-            McpError::Config(msg) => ErrorData::invalid_request(msg, None),
-            McpError::InvalidInput(msg) => ErrorData::invalid_params(msg, None),
-            McpError::ValidationFailed(msg) => ErrorData::invalid_params(msg, None),
-            McpError::InjectionDetected(msg) => ErrorData::invalid_params(msg, None),
-            McpError::ResourceNotFound(msg) => {
-                ErrorData::invalid_params(format!("Resource not found: {}", msg), None)
+            ServerError::Config(msg) => McpError::invalid_request(msg),
+            ServerError::InvalidInput(msg) => McpError::invalid_params("input", msg),
+            ServerError::ValidationFailed(msg) => McpError::invalid_params("query", msg),
+            ServerError::InjectionDetected(msg) => McpError::invalid_params("query", msg),
+            ServerError::ResourceNotFound(msg) => McpError::resource_not_found(msg),
+            ServerError::SessionNotFound(msg) => {
+                McpError::invalid_params("session_id", format!("Session not found: {}", msg))
             }
-            McpError::SessionNotFound(msg) => {
-                ErrorData::invalid_params(format!("Session not found: {}", msg), None)
+            ServerError::ObjectNotFound { object_type, name } => {
+                McpError::invalid_params("name", format!("{} not found: {}", object_type, name))
             }
-            McpError::ObjectNotFound { object_type, name } => {
-                ErrorData::invalid_params(format!("{} not found: {}", object_type, name), None)
+            ServerError::Connection { message, .. } => McpError::internal(message),
+            ServerError::Authentication(message) => McpError::internal(message),
+            ServerError::DatabaseNotFound(message) => McpError::internal(message),
+            ServerError::PermissionDenied(message) => McpError::internal(message),
+            ServerError::Session(message) => McpError::internal(message),
+            ServerError::Internal(message) => McpError::internal(message),
+            ServerError::QueryExecution { message, .. } => McpError::internal(message),
+            ServerError::Timeout { timeout_seconds } => {
+                McpError::internal(format!("Query timeout after {} seconds", timeout_seconds))
             }
-            McpError::Connection { message, .. }
-            | McpError::Authentication(message)
-            | McpError::DatabaseNotFound(message)
-            | McpError::PermissionDenied(message)
-            | McpError::Session(message)
-            | McpError::Internal(message) => ErrorData::internal_error(message, None),
-            McpError::QueryExecution { message, .. } => ErrorData::internal_error(message, None),
-            McpError::Timeout { timeout_seconds } => ErrorData::internal_error(
-                format!("Query timeout after {} seconds", timeout_seconds),
-                None,
-            ),
-            McpError::CircuitOpen {
+            ServerError::CircuitOpen {
                 retry_after_seconds,
-            } => ErrorData::internal_error(
-                format!(
-                    "Service unavailable, circuit breaker open. Retry after {} seconds",
-                    retry_after_seconds
-                ),
-                None,
-            ),
-            McpError::ConstraintViolation(msg) | McpError::DataTruncation(msg) => {
-                ErrorData::internal_error(msg, None)
+            } => McpError::internal(format!(
+                "Service unavailable, circuit breaker open. Retry after {} seconds",
+                retry_after_seconds
+            )),
+            ServerError::ConstraintViolation(msg) | ServerError::DataTruncation(msg) => {
+                McpError::internal(msg)
             }
         }
     }
 }
 
-impl From<mssql_client::Error> for McpError {
+impl From<mssql_client::Error> for ServerError {
     fn from(e: mssql_client::Error) -> Self {
         use mssql_client::Error;
 
@@ -369,43 +365,43 @@ impl From<mssql_client::Error> for McpError {
             Error::Server {
                 number, message, ..
             } => from_sql_error(*number, message),
-            Error::Io(_) => McpError::connection(format!("IO error: {}", e)),
-            Error::Tls(_) => McpError::connection(format!("TLS error: {}", e)),
-            Error::Protocol(_) => McpError::connection(format!("Protocol error: {}", e)),
-            Error::Authentication(_) => McpError::auth(e.to_string()),
-            Error::Connection(_) => McpError::connection(e.to_string()),
-            Error::ConnectionClosed => McpError::connection("Connection closed"),
+            Error::Io(_) => ServerError::connection(format!("IO error: {}", e)),
+            Error::Tls(_) => ServerError::connection(format!("TLS error: {}", e)),
+            Error::Protocol(_) => ServerError::connection(format!("Protocol error: {}", e)),
+            Error::Authentication(_) => ServerError::auth(e.to_string()),
+            Error::Connection(_) => ServerError::connection(e.to_string()),
+            Error::ConnectionClosed => ServerError::connection("Connection closed"),
             Error::ConnectTimeout | Error::ConnectionTimeout | Error::CommandTimeout => {
-                McpError::timeout(0)
+                ServerError::timeout(0)
             }
-            Error::Type(_) => McpError::query_error(format!("Type conversion error: {}", e)),
-            Error::Codec(_) => McpError::query_error(format!("Codec error: {}", e)),
-            Error::Query(_) => McpError::query_error(e.to_string()),
-            Error::Transaction(_) => McpError::query_error(format!("Transaction error: {}", e)),
-            Error::Config(_) => McpError::config(e.to_string()),
-            Error::PoolExhausted => McpError::connection("Connection pool exhausted"),
-            Error::Cancelled => McpError::query_error("Query was cancelled"),
-            _ => McpError::internal(e.to_string()),
+            Error::Type(_) => ServerError::query_error(format!("Type conversion error: {}", e)),
+            Error::Codec(_) => ServerError::query_error(format!("Codec error: {}", e)),
+            Error::Query(_) => ServerError::query_error(e.to_string()),
+            Error::Transaction(_) => ServerError::query_error(format!("Transaction error: {}", e)),
+            Error::Config(_) => ServerError::config(e.to_string()),
+            Error::PoolExhausted => ServerError::connection("Connection pool exhausted"),
+            Error::Cancelled => ServerError::query_error("Query was cancelled"),
+            _ => ServerError::internal(e.to_string()),
         }
     }
 }
 
-impl From<mssql_driver_pool::PoolError> for McpError {
+impl From<mssql_driver_pool::PoolError> for ServerError {
     fn from(e: mssql_driver_pool::PoolError) -> Self {
-        McpError::connection(format!("Pool error: {}", e))
+        ServerError::connection(format!("Pool error: {}", e))
     }
 }
 
-impl From<std::io::ErrorKind> for McpError {
+impl From<std::io::ErrorKind> for ServerError {
     fn from(kind: std::io::ErrorKind) -> Self {
         use std::io::ErrorKind;
         match kind {
-            ErrorKind::ConnectionRefused => McpError::connection("Connection refused"),
-            ErrorKind::ConnectionReset => McpError::connection("Connection reset"),
-            ErrorKind::ConnectionAborted => McpError::connection("Connection aborted"),
-            ErrorKind::NotConnected => McpError::connection("Not connected"),
-            ErrorKind::TimedOut => McpError::timeout(0),
-            _ => McpError::connection(format!("IO error: {:?}", kind)),
+            ErrorKind::ConnectionRefused => ServerError::connection("Connection refused"),
+            ErrorKind::ConnectionReset => ServerError::connection("Connection reset"),
+            ErrorKind::ConnectionAborted => ServerError::connection("Connection aborted"),
+            ErrorKind::NotConnected => ServerError::connection("Not connected"),
+            ErrorKind::TimedOut => ServerError::timeout(0),
+            _ => ServerError::connection(format!("IO error: {:?}", kind)),
         }
     }
 }
@@ -417,33 +413,33 @@ mod tests {
     #[test]
     fn test_sql_error_mapping() {
         let err = from_sql_error(18456, "Login failed for user 'test'");
-        assert!(matches!(err, McpError::Authentication(_)));
+        assert!(matches!(err, ServerError::Authentication(_)));
 
         let err = from_sql_error(208, "Invalid object name 'foo'");
-        assert!(matches!(err, McpError::ObjectNotFound { .. }));
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
 
         let err = from_sql_error(229, "SELECT permission denied");
-        assert!(matches!(err, McpError::PermissionDenied(_)));
+        assert!(matches!(err, ServerError::PermissionDenied(_)));
     }
 
     #[test]
     fn test_transient_errors() {
-        let err = McpError::timeout(30);
+        let err = ServerError::timeout(30);
         assert!(err.is_transient());
 
-        let err = McpError::connection("test");
+        let err = ServerError::connection("test");
         assert!(err.is_transient());
 
-        let err = McpError::auth("test");
+        let err = ServerError::auth("test");
         assert!(!err.is_transient());
     }
 
     #[test]
     fn test_error_suggestions() {
-        let err = McpError::auth("Login failed");
+        let err = ServerError::auth("Login failed");
         assert!(err.suggestion().is_some());
 
-        let err = McpError::Internal("unknown".to_string());
+        let err = ServerError::Internal("unknown".to_string());
         assert!(err.suggestion().is_none());
     }
 }

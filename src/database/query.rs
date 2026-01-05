@@ -2,7 +2,7 @@
 
 use crate::database::types::{SqlValue, TypeMapper};
 use crate::database::ConnectionPool;
-use crate::error::McpError;
+use crate::error::ServerError;
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -197,7 +197,7 @@ impl QueryExecutor {
     }
 
     /// Execute a query and return results.
-    pub async fn execute(&self, query: &str) -> Result<QueryResult, McpError> {
+    pub async fn execute(&self, query: &str) -> Result<QueryResult, ServerError> {
         self.execute_with_limit(query, self.max_rows).await
     }
 
@@ -206,7 +206,7 @@ impl QueryExecutor {
         &self,
         query: &str,
         max_rows: usize,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         self.execute_with_options(query, max_rows, None).await
     }
 
@@ -215,7 +215,7 @@ impl QueryExecutor {
         &self,
         query: &str,
         timeout_seconds: u64,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         self.execute_with_options(query, self.max_rows, Some(timeout_seconds))
             .await
     }
@@ -229,7 +229,7 @@ impl QueryExecutor {
         query: &str,
         max_rows: usize,
         timeout_seconds: Option<u64>,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         let start = Instant::now();
 
         debug!(
@@ -242,17 +242,17 @@ impl QueryExecutor {
         // Wrap execution in timeout if specified
         let execution_future = async {
             let mut conn = self.pool.get().await.map_err(|e| {
-                McpError::connection(format!("Failed to get connection from pool: {}", e))
+                ServerError::connection(format!("Failed to get connection from pool: {}", e))
             })?;
 
             let stream = conn
                 .query(query, &[])
                 .await
-                .map_err(|e| McpError::query_error(format!("Query execution failed: {}", e)))?;
+                .map_err(|e| ServerError::query_error(format!("Query execution failed: {}", e)))?;
 
             // Collect stream to Vec
             let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
-                McpError::query_error(format!("Failed to collect query results: {}", e))
+                ServerError::query_error(format!("Failed to collect query results: {}", e))
             })?;
 
             self.process_rows(rows, max_rows, start)
@@ -262,7 +262,7 @@ impl QueryExecutor {
             let duration = Duration::from_secs(secs);
             timeout(duration, execution_future)
                 .await
-                .map_err(|_| McpError::timeout(secs))?
+                .map_err(|_| ServerError::timeout(secs))?
         } else {
             execution_future.await
         }?;
@@ -277,20 +277,20 @@ impl QueryExecutor {
     }
 
     /// Execute a query that modifies data (INSERT/UPDATE/DELETE).
-    pub async fn execute_non_query(&self, query: &str) -> Result<QueryResult, McpError> {
+    pub async fn execute_non_query(&self, query: &str) -> Result<QueryResult, ServerError> {
         let start = Instant::now();
 
         debug!("Executing non-query: {}", truncate_for_log(query, 200));
 
         let mut conn = self.pool.get().await.map_err(|e| {
-            McpError::connection(format!("Failed to get connection from pool: {}", e))
+            ServerError::connection(format!("Failed to get connection from pool: {}", e))
         })?;
 
         // Execute query - returns rows affected directly as u64
         let rows_affected = conn
             .execute(query, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Non-query execution failed: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Non-query execution failed: {}", e)))?;
 
         debug!("Non-query completed: {} rows affected", rows_affected);
 
@@ -308,23 +308,23 @@ impl QueryExecutor {
     /// This is required for DDL statements that must be the only/first statement
     /// in a batch, such as CREATE VIEW, CREATE PROCEDURE, CREATE FUNCTION, and
     /// CREATE TRIGGER.
-    pub async fn execute_raw(&self, query: &str) -> Result<QueryResult, McpError> {
+    pub async fn execute_raw(&self, query: &str) -> Result<QueryResult, ServerError> {
         let start = Instant::now();
 
         debug!("Executing raw query: {}", truncate_for_log(query, 200));
 
         let mut conn = self.pool.get().await.map_err(|e| {
-            McpError::connection(format!("Failed to get connection from pool: {}", e))
+            ServerError::connection(format!("Failed to get connection from pool: {}", e))
         })?;
 
         // Execute raw SQL
         let stream = conn
             .query(query, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Raw query failed: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Raw query failed: {}", e)))?;
 
         let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
-            McpError::query_error(format!("Failed to collect raw query results: {}", e))
+            ServerError::query_error(format!("Failed to collect raw query results: {}", e))
         })?;
 
         let result = self.process_rows(rows, self.max_rows, start)?;
@@ -376,7 +376,7 @@ impl QueryExecutor {
         &self,
         query: &str,
         plan_type: &str,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         let start = Instant::now();
 
         debug!(
@@ -386,7 +386,7 @@ impl QueryExecutor {
         );
 
         let mut conn = self.pool.get().await.map_err(|e| {
-            McpError::connection(format!("Failed to get connection from pool: {}", e))
+            ServerError::connection(format!("Failed to get connection from pool: {}", e))
         })?;
 
         // Determine which SET statements to use based on plan type
@@ -403,15 +403,15 @@ impl QueryExecutor {
             // Execute SET SHOWPLAN_ALL ON as its own batch
             conn.execute(set_on, &[])
                 .await
-                .map_err(|e| McpError::query_error(format!("Failed to enable SHOWPLAN: {}", e)))?;
+                .map_err(|e| ServerError::query_error(format!("Failed to enable SHOWPLAN: {}", e)))?;
 
             // Execute the query - with SHOWPLAN ON, this returns the execution plan
             let stream = conn.query(query, &[]).await.map_err(|e| {
-                McpError::query_error(format!("Failed to get execution plan: {}", e))
+                ServerError::query_error(format!("Failed to get execution plan: {}", e))
             })?;
 
             let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
-                McpError::query_error(format!("Failed to collect execution plan: {}", e))
+                ServerError::query_error(format!("Failed to collect execution plan: {}", e))
             })?;
 
             // Turn off SHOWPLAN (best effort)
@@ -431,11 +431,11 @@ impl QueryExecutor {
             // the same batch restriction
             let full_query = format!("{}\n{}\n{}", set_on, query, set_off);
             let stream = conn.query(&full_query, &[]).await.map_err(|e| {
-                McpError::query_error(format!("Failed to execute with statistics: {}", e))
+                ServerError::query_error(format!("Failed to execute with statistics: {}", e))
             })?;
 
             let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
-                McpError::query_error(format!("Failed to collect statistics results: {}", e))
+                ServerError::query_error(format!("Failed to collect statistics results: {}", e))
             })?;
 
             let result = self.process_rows(rows, self.max_rows, start)?;
@@ -456,7 +456,7 @@ impl QueryExecutor {
         rows: Vec<mssql_client::Row>,
         max_rows: usize,
         start: Instant,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         let mut columns: Vec<ColumnInfo> = Vec::new();
         let mut result_rows: Vec<ResultRow> = Vec::new();
         let mut truncated = false;
@@ -514,7 +514,7 @@ impl QueryExecutor {
     /// GO is not a T-SQL command - it's a batch separator used by tools like SSMS.
     /// This method splits the script on GO and executes each batch sequentially.
     /// Results from all batches are combined into a single result.
-    pub async fn execute_multi_batch(&self, script: &str) -> Result<QueryResult, McpError> {
+    pub async fn execute_multi_batch(&self, script: &str) -> Result<QueryResult, ServerError> {
         let start = Instant::now();
         let batches = split_on_go(script);
 
@@ -528,7 +528,7 @@ impl QueryExecutor {
         let mut batch_num = 0;
 
         let mut conn = self.pool.get().await.map_err(|e| {
-            McpError::connection(format!("Failed to get connection from pool: {}", e))
+            ServerError::connection(format!("Failed to get connection from pool: {}", e))
         })?;
 
         for batch in batches {
@@ -548,10 +548,10 @@ impl QueryExecutor {
             let stream = conn
                 .query(trimmed, &[])
                 .await
-                .map_err(|e| McpError::query_error(format!("Batch {} failed: {}", batch_num, e)))?;
+                .map_err(|e| ServerError::query_error(format!("Batch {} failed: {}", batch_num, e)))?;
 
             let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
-                McpError::query_error(format!(
+                ServerError::query_error(format!(
                     "Batch {} result collection failed: {}",
                     batch_num, e
                 ))

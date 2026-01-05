@@ -11,13 +11,14 @@ categories = ["database", "development-tools"]
 
 [features]
 default = []
-http = ["dep:axum", "dep:tower", "dep:tower-http", "dep:hyper"]
+http = ["dep:mcpkit-axum", "dep:axum", "dep:tower", "dep:tower-http", "dep:hyper"]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 azure-auth = ["dep:azure_identity", "dep:azure_core"]
 
 [dependencies]
-# MCP Protocol SDK - Official Rust implementation
-rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
+# MCP Protocol SDK
+mcpkit = { version = "0.5.0", features = ["server", "tokio-runtime"] }
+mcpkit-axum = { version = "0.5.0", optional = true }
 
 # HTTP server (optional, for SSE transport)
 axum = { version = "0.8", optional = true }
@@ -41,8 +42,8 @@ tokio = { version = "1", features = ["full"] }
 
 # SQL Server connectivity - modern TDS 7.4/8.0 driver with integrated pooling
 # Default features include chrono, uuid, and decimal
-mssql-client = "0.3.0"
-mssql-driver-pool = "0.3.0"
+mssql-client = "0.5.2"
+mssql-driver-pool = "0.5.2"
 
 # Futures utilities (for TryStreamExt)
 futures-util = "0.3"
@@ -50,9 +51,6 @@ futures-util = "0.3"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# JSON Schema generation for tool documentation (must match rmcp's version)
-schemars = "1.0"
 
 # Error handling
 thiserror = "2.0"

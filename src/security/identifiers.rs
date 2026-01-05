@@ -3,7 +3,7 @@
 //! Uses SQL Server's bracket notation `[identifier]` to safely escape identifiers.
 //! Also provides validation against SQL reserved keywords.
 
-use crate::error::McpError;
+use crate::error::ServerError;
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 
@@ -27,9 +27,9 @@ pub const MAX_IDENTIFIER_LENGTH: usize = 128;
 /// assert_eq!(escape_identifier("dbo.Users").unwrap(), "[dbo].[Users]");
 /// assert_eq!(escape_identifier("My Table").unwrap(), "[My Table]");
 /// ```
-pub fn escape_identifier(identifier: &str) -> Result<String, McpError> {
+pub fn escape_identifier(identifier: &str) -> Result<String, ServerError> {
     if identifier.is_empty() {
-        return Err(McpError::invalid_input("Identifier cannot be empty"));
+        return Err(ServerError::invalid_input("Identifier cannot be empty"));
     }
 
     // Handle schema-qualified names (e.g., "dbo.Users")
@@ -46,15 +46,15 @@ pub fn escape_identifier(identifier: &str) -> Result<String, McpError> {
 }
 
 /// Escape a single identifier (no dots).
-fn escape_single_identifier(identifier: &str) -> Result<String, McpError> {
+fn escape_single_identifier(identifier: &str) -> Result<String, ServerError> {
     let trimmed = identifier.trim();
 
     if trimmed.is_empty() {
-        return Err(McpError::invalid_input("Identifier cannot be empty"));
+        return Err(ServerError::invalid_input("Identifier cannot be empty"));
     }
 
     if trimmed.len() > MAX_IDENTIFIER_LENGTH {
-        return Err(McpError::invalid_input(format!(
+        return Err(ServerError::invalid_input(format!(
             "Identifier exceeds maximum length of {} characters",
             MAX_IDENTIFIER_LENGTH
         )));
@@ -78,13 +78,13 @@ fn escape_single_identifier(identifier: &str) -> Result<String, McpError> {
 ///
 /// This is a stricter validation for use cases where we want to ensure
 /// the identifier doesn't contain any potentially dangerous characters.
-pub fn validate_identifier(identifier: &str) -> Result<(), McpError> {
+pub fn validate_identifier(identifier: &str) -> Result<(), ServerError> {
     if identifier.is_empty() {
-        return Err(McpError::invalid_input("Identifier cannot be empty"));
+        return Err(ServerError::invalid_input("Identifier cannot be empty"));
     }
 
     if identifier.len() > MAX_IDENTIFIER_LENGTH {
-        return Err(McpError::invalid_input(format!(
+        return Err(ServerError::invalid_input(format!(
             "Identifier exceeds maximum length of {} characters",
             MAX_IDENTIFIER_LENGTH
         )));
@@ -104,7 +104,7 @@ pub fn validate_identifier(identifier: &str) -> Result<(), McpError> {
 
     for pattern in &dangerous_patterns {
         if identifier.contains(pattern) {
-            return Err(McpError::invalid_input(format!(
+            return Err(ServerError::invalid_input(format!(
                 "Identifier contains forbidden character sequence: {}",
                 pattern
             )));
@@ -119,7 +119,7 @@ pub fn validate_identifier(identifier: &str) -> Result<(), McpError> {
 /// This combines validation, escaping, and reserved keyword warnings.
 /// If the identifier is a SQL reserved keyword, a warning is logged
 /// but the operation proceeds (bracket escaping makes it safe to use).
-pub fn safe_identifier(identifier: &str) -> Result<String, McpError> {
+pub fn safe_identifier(identifier: &str) -> Result<String, ServerError> {
     validate_identifier(identifier)?;
     // Warn about reserved keywords (but allow them since escaping handles it)
     warn_if_reserved(identifier, "identifier");
@@ -129,9 +129,9 @@ pub fn safe_identifier(identifier: &str) -> Result<String, McpError> {
 /// Parse a potentially schema-qualified identifier.
 ///
 /// Returns (schema, name) tuple. Schema is None if not specified.
-pub fn parse_qualified_name(identifier: &str) -> Result<(Option<String>, String), McpError> {
+pub fn parse_qualified_name(identifier: &str) -> Result<(Option<String>, String), ServerError> {
     if identifier.is_empty() {
-        return Err(McpError::invalid_input("Identifier cannot be empty"));
+        return Err(ServerError::invalid_input("Identifier cannot be empty"));
     }
 
     if identifier.contains('.') {
@@ -464,7 +464,7 @@ pub fn is_reserved_keyword(identifier: &str) -> bool {
 /// Validate that an identifier is not a reserved keyword.
 ///
 /// Returns an error if the identifier is a reserved keyword without bracket escaping.
-pub fn validate_not_reserved(identifier: &str) -> Result<(), McpError> {
+pub fn validate_not_reserved(identifier: &str) -> Result<(), ServerError> {
     // Extract the actual name from bracket-escaped identifiers
     let name = if identifier.starts_with('[') && identifier.ends_with(']') {
         // Already escaped, so it's safe to use
@@ -479,7 +479,7 @@ pub fn validate_not_reserved(identifier: &str) -> Result<(), McpError> {
             };
 
             if is_reserved_keyword(clean_part) {
-                return Err(McpError::invalid_input(format!(
+                return Err(ServerError::invalid_input(format!(
                     "'{}' is a SQL reserved keyword. Consider using bracket escaping: [{}]",
                     clean_part, clean_part
                 )));
@@ -491,7 +491,7 @@ pub fn validate_not_reserved(identifier: &str) -> Result<(), McpError> {
     };
 
     if is_reserved_keyword(name) {
-        return Err(McpError::invalid_input(format!(
+        return Err(ServerError::invalid_input(format!(
             "'{}' is a SQL reserved keyword. Consider using bracket escaping: [{}]",
             name, name
         )));

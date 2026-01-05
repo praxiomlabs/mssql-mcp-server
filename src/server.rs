@@ -4,11 +4,10 @@ use crate::config::Config;
 use crate::database::{
     create_pool, ConnectionPool, MetadataQueries, QueryExecutor, SessionManager, TransactionManager,
 };
-use crate::error::McpError;
+use crate::error::ServerError;
 use crate::security::QueryValidator;
 use crate::state::{new_shared_state, SharedState};
 use crate::telemetry::{new_shared_metrics, SharedMetrics};
-use rmcp::handler::server::router::tool::ToolRouter;
 use std::sync::Arc;
 
 /// The MSSQL MCP Server instance.
@@ -39,9 +38,6 @@ pub struct MssqlMcpServer {
     /// Query validator for security.
     pub(crate) validator: Arc<QueryValidator>,
 
-    /// Tool router for dispatching tool calls.
-    pub(crate) tool_router: ToolRouter<Self>,
-
     /// Server metrics for telemetry.
     pub(crate) metrics: SharedMetrics,
 
@@ -58,8 +54,7 @@ impl MssqlMcpServer {
     /// This performs async initialization including:
     /// - Creating the connection pool
     /// - Validating the database connection
-    /// - Setting up the tool router
-    pub async fn new(config: Config) -> Result<Self, McpError> {
+    pub async fn new(config: Config) -> Result<Self, ServerError> {
         // Create connection pool (wrapped in Arc for sharing)
         let pool = Arc::new(create_pool(&config.database).await?);
 
@@ -91,9 +86,6 @@ impl MssqlMcpServer {
             config.security.max_query_length,
         ));
 
-        // Create tool router (will be implemented in tools module)
-        let tool_router = crate::tools::create_tool_router();
-
         // Create metrics collector
         let metrics = new_shared_metrics();
 
@@ -118,7 +110,6 @@ impl MssqlMcpServer {
             executor,
             metadata,
             validator,
-            tool_router,
             metrics,
             transaction_manager,
             session_manager,
@@ -128,7 +119,7 @@ impl MssqlMcpServer {
     /// Create a server from environment variables.
     ///
     /// This is the standard way to create a server for production use.
-    pub async fn from_env() -> Result<Self, McpError> {
+    pub async fn from_env() -> Result<Self, ServerError> {
         let config = Config::from_env()?;
         Self::new(config).await
     }
@@ -189,13 +180,13 @@ impl MssqlMcpServer {
     }
 
     /// Validate a query using the configured security settings.
-    pub fn validate_query(&self, query: &str) -> Result<(), McpError> {
+    pub fn validate_query(&self, query: &str) -> Result<(), ServerError> {
         // Validate using security module (it also checks query length)
         let result = self.validator.validate(query)?;
 
         // ValidationResult.valid should be true if no error was returned
         if !result.valid {
-            return Err(McpError::validation(
+            return Err(ServerError::validation(
                 result
                     .message
                     .unwrap_or_else(|| "Query validation failed".to_string()),

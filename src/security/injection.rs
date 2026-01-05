@@ -2,7 +2,7 @@
 //!
 //! Detects common SQL injection patterns in queries.
 
-use crate::error::McpError;
+use crate::error::ServerError;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -94,14 +94,14 @@ impl InjectionDetector {
     ///
     /// Returns `Ok(())` if no injection is detected, or an error describing
     /// the detected pattern.
-    pub fn check(&self, query: &str) -> Result<(), McpError> {
+    pub fn check(&self, query: &str) -> Result<(), ServerError> {
         if !self.enabled {
             return Ok(());
         }
 
         for (pattern, description) in INJECTION_PATTERNS.iter() {
             if pattern.is_match(query) {
-                return Err(McpError::injection(*description));
+                return Err(ServerError::injection(*description));
             }
         }
 
@@ -111,7 +111,7 @@ impl InjectionDetector {
     /// Check if a string value might contain injection.
     ///
     /// This is for checking parameter values, not full queries.
-    pub fn check_value(&self, value: &str) -> Result<(), McpError> {
+    pub fn check_value(&self, value: &str) -> Result<(), ServerError> {
         if !self.enabled {
             return Ok(());
         }
@@ -128,7 +128,7 @@ impl InjectionDetector {
         let upper = value.to_uppercase();
         for (pattern, description) in dangerous_patterns {
             if upper.contains(pattern) {
-                return Err(McpError::injection(description));
+                return Err(ServerError::injection(description));
             }
         }
 

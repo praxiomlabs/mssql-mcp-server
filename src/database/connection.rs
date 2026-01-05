@@ -2,7 +2,7 @@
 
 use super::auth::create_config;
 use crate::config::DatabaseConfig;
-use crate::error::McpError;
+use crate::error::ServerError;
 use mssql_driver_pool::{Pool, PoolBuilder, PooledConnection};
 use tracing::{debug, info};
 
@@ -13,7 +13,7 @@ pub type ConnectionPool = Pool;
 pub type PooledConn = PooledConnection;
 
 /// Create a connection pool from configuration.
-pub async fn create_pool(config: &DatabaseConfig) -> Result<ConnectionPool, McpError> {
+pub async fn create_pool(config: &DatabaseConfig) -> Result<ConnectionPool, ServerError> {
     info!(
         "Creating connection pool for {}:{} (min: {}, max: {})",
         config.host, config.port, config.pool.min_connections, config.pool.max_connections
@@ -32,12 +32,12 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<ConnectionPool, McpE
         .sp_reset_connection(true) // Enable connection state cleanup
         .build()
         .await
-        .map_err(|e| McpError::connection_with_source("Failed to create connection pool", e))?;
+        .map_err(|e| ServerError::connection_with_source("Failed to create connection pool", e))?;
 
     // Test the pool by getting a connection
     {
         let _conn = pool.get().await.map_err(|e| {
-            McpError::connection(format!("Failed to establish initial connection: {}", e))
+            ServerError::connection(format!("Failed to establish initial connection: {}", e))
         })?;
         debug!("Initial connection test successful");
         // Connection dropped here, releasing borrow and returning to pool

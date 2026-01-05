@@ -10,11 +10,11 @@
 //! - Cache cleanup
 
 use anyhow::Result;
+use mcpkit::transport::stdio::StdioTransport;
 use mssql_mcp_server::shutdown::{
     install_signal_handlers, new_shutdown_controller_with_timeouts, ShutdownConfig,
 };
 use mssql_mcp_server::{Config, MssqlMcpServer};
-use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -55,16 +55,13 @@ async fn main() -> Result<()> {
     eprintln!("Server initialized. Ready to accept requests...");
 
     // Start serving on stdio transport
-    let transport = rmcp::transport::stdio();
-    let service = server.serve(transport).await?;
-
-    // Wait for shutdown signal or service completion
+    let mcp_server = server.into_server();
     let mut shutdown_signal = shutdown_controller.signal();
 
     tokio::select! {
-        quit_reason = service.waiting() => {
-            match quit_reason {
-                Ok(reason) => eprintln!("Service stopped: {reason:?}"),
+        result = mcp_server.serve(StdioTransport::new()) => {
+            match result {
+                Ok(()) => eprintln!("Service stopped normally"),
                 Err(e) => eprintln!("Service error: {e}"),
             }
         }

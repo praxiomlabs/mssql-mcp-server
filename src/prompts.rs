@@ -4,16 +4,13 @@
 //! by providing schema information and best practices.
 
 use crate::server::MssqlMcpServer;
-use rmcp::model::{
-    GetPromptResult, Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole,
-};
+use mcpkit::prelude::{Content, GetPromptResult, Prompt, PromptArgument, PromptMessage, Role};
 use std::collections::HashMap;
 
 /// Create a prompt argument helper.
 fn prompt_arg(name: &str, description: &str, required: bool) -> PromptArgument {
     PromptArgument {
         name: name.to_string(),
-        title: None,
         description: Some(description.to_string()),
         required: Some(required),
     }
@@ -23,11 +20,8 @@ fn prompt_arg(name: &str, description: &str, required: bool) -> PromptArgument {
 fn prompt(name: &str, description: &str, arguments: Vec<PromptArgument>) -> Prompt {
     Prompt {
         name: name.to_string(),
-        title: None,
         description: Some(description.to_string()),
         arguments: Some(arguments),
-        icons: None,
-        meta: None,
     }
 }
 
@@ -182,8 +176,8 @@ async fn get_query_table_prompt(
     Ok(GetPromptResult {
         description: Some(format!("Query builder for {}.{}", schema, table)),
         messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(prompt_text),
+            role: Role::User,
+            content: Content::text(prompt_text),
         }],
     })
 }
@@ -265,8 +259,8 @@ Please analyze this schema and provide:
     Ok(GetPromptResult {
         description: Some(format!("Schema analysis for {}.{}", schema, table)),
         messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(prompt_text),
+            role: Role::User,
+            content: Content::text(prompt_text),
         }],
     })
 }
@@ -366,8 +360,8 @@ Replace the placeholder values with actual data. Note:
     Ok(GetPromptResult {
         description: Some(format!("INSERT template for {}.{}", schema, table)),
         messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(prompt_text),
+            role: Role::User,
+            content: Content::text(prompt_text),
         }],
     })
 }
@@ -442,8 +436,8 @@ async fn get_explain_procedure_prompt(
     Ok(GetPromptResult {
         description: Some(format!("Explanation of {}.{}", schema, procedure)),
         messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(prompt_text),
+            role: Role::User,
+            content: Content::text(prompt_text),
         }],
     })
 }
@@ -492,8 +486,8 @@ fn get_optimize_query_prompt(args: &HashMap<String, String>) -> Result<GetPrompt
     Ok(GetPromptResult {
         description: Some("Query optimization analysis".to_string()),
         messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(prompt_text),
+            role: Role::User,
+            content: Content::text(prompt_text),
         }],
     })
 }
@@ -542,8 +536,8 @@ fn get_debug_error_prompt(args: &HashMap<String, String>) -> Result<GetPromptRes
     Ok(GetPromptResult {
         description: Some("SQL Server error debugging".to_string()),
         messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(prompt_text),
+            role: Role::User,
+            content: Content::text(prompt_text),
         }],
     })
 }

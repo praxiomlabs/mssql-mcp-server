@@ -23,10 +23,8 @@
 
 use crate::security::{parse_qualified_name, validate_identifier};
 use crate::server::MssqlMcpServer;
-use rmcp::model::{
-    AnnotateAble, RawResource, RawResourceTemplate, ReadResourceResult, Resource, ResourceContents,
-    ResourceTemplate,
-};
+use mcpkit::prelude::{Resource, ResourceContents, ResourceTemplate};
+use mcpkit::types::ReadResourceResult;
 use serde_json::json;
 
 /// Build the list of available resources based on server state.
@@ -740,10 +738,14 @@ async fn read_trigger_details(
 
 /// Create a resource definition.
 fn create_resource(uri: &str, name: &str, description: &str, mime_type: &str) -> Resource {
-    let mut resource = RawResource::new(uri, name);
-    resource.description = Some(description.to_string());
-    resource.mime_type = Some(mime_type.to_string());
-    resource.no_annotation()
+    Resource {
+        uri: uri.to_string(),
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        mime_type: Some(mime_type.to_string()),
+        annotations: None,
+        size: None,
+    }
 }
 
 /// Create a resource template definition.
@@ -753,14 +755,13 @@ fn create_resource_template(
     description: &str,
     mime_type: &str,
 ) -> ResourceTemplate {
-    RawResourceTemplate {
+    ResourceTemplate {
         uri_template: uri_template.to_string(),
         name: name.to_string(),
-        title: None,
         description: Some(description.to_string()),
         mime_type: Some(mime_type.to_string()),
+        annotations: None,
     }
-    .no_annotation()
 }
 
 #[cfg(test)]

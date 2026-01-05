@@ -42,31 +42,19 @@ pub use inputs::*;
 use crate::security::{parse_qualified_name, safe_identifier, validate_identifier};
 use crate::server::MssqlMcpServer;
 use crate::state::{IsolationLevel, SessionStatus, TransactionStatus};
-use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
-use rmcp::{tool, tool_router, ErrorData};
+use mcpkit::prelude::*;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
-/// Create the tool router for the MCP server.
+/// MCP server implementation containing all tools, resources, and prompts.
 ///
-/// This function is called during server initialization to set up
-/// all available tools.
-pub fn create_tool_router() -> ToolRouter<MssqlMcpServer> {
-    MssqlMcpServer::tool_router()
-}
-
-/// Create a tool error result.
-fn tool_error(message: impl Into<String>) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(message.into())])
-}
-
-/// Tool router implementation containing all MCP tools.
-///
-/// The `#[tool_router]` macro generates the routing infrastructure
-/// for all `#[tool]` annotated methods in this impl block.
-#[tool_router]
+/// The `#[mcp_server]` macro generates the MCP protocol infrastructure
+/// for all `#[tool]`, `#[resource]`, and `#[prompt]` annotated methods.
+#[mcp_server(
+    name = "mssql-mcp-server",
+    version = "0.1.0",
+    instructions = "SQL Server database operations - query execution, metadata, and administration"
+)]
 impl MssqlMcpServer {
     // =========================================================================
     // Query Execution Tools
@@ -76,21 +64,18 @@ impl MssqlMcpServer {
     ///
     /// This tool executes arbitrary SQL queries against the database.
     /// Queries are validated according to the server's security configuration.
-    #[tool(
-        name = "execute_query",
-        description = "Execute a SQL query and return results. Supports SELECT, INSERT, UPDATE, DELETE based on security mode."
-    )]
+    #[tool(description = "Execute a SQL query and return results. Supports SELECT, INSERT, UPDATE, DELETE based on security mode.")]
     pub async fn execute_query(
         &self,
-        Parameters(input): Parameters<ExecuteQueryInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExecuteQueryInput,
+    ) -> Result<ToolOutput, McpError> {
         use crate::database::QueryExecutor;
 
         debug!("Executing query: {}", truncate_for_log(&input.query, 100));
 
         // Validate the query
         if let Err(e) = self.validate_query(&input.query) {
-            return Ok(tool_error(format!("Query validation failed: {}", e)));
+            return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
         // Determine row limit
@@ -106,7 +91,7 @@ impl MssqlMcpServer {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Multi-batch execution failed: {}", e);
-                    return Ok(tool_error(format!("Query execution failed: {}", e)));
+                    return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
                 }
             }
         } else if QueryExecutor::requires_raw_execution(&input.query) {
@@ -117,7 +102,7 @@ impl MssqlMcpServer {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Raw query execution failed: {}", e);
-                    return Ok(tool_error(format!("Query execution failed: {}", e)));
+                    return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
                 }
             }
         } else {
@@ -131,7 +116,7 @@ impl MssqlMcpServer {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Query execution failed: {}", e);
-                    return Ok(tool_error(format!("Query execution failed: {}", e)));
+                    return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
                 }
             }
         };
@@ -146,20 +131,17 @@ impl MssqlMcpServer {
             OutputFormat::Table => result.to_markdown_table(),
         };
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     /// Explain a SQL query's execution plan.
     ///
     /// Returns the estimated or actual execution plan for analysis.
-    #[tool(
-        name = "explain_query",
-        description = "Get the execution plan for a SQL query. Useful for query optimization."
-    )]
+    #[tool(description = "Get the execution plan for a SQL query. Useful for query optimization.")]
     pub async fn explain_query(
         &self,
-        Parameters(input): Parameters<ExplainQueryInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExplainQueryInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Explaining query: {}", truncate_for_log(&input.query, 100));
 
         // Use the executor's showplan method which handles the batch separation correctly
@@ -170,12 +152,12 @@ impl MssqlMcpServer {
         {
             Ok(r) => r,
             Err(e) => {
-                return Ok(tool_error(format!("Failed to get execution plan: {}", e)));
+                return Ok(ToolOutput::error(format!("Failed to get execution plan: {}", e)));
             }
         };
 
         let output = result.to_markdown_table();
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     // =========================================================================
@@ -185,24 +167,21 @@ impl MssqlMcpServer {
     /// Execute a stored procedure.
     ///
     /// This tool executes stored procedures with parameter binding.
-    #[tool(
-        name = "execute_procedure",
-        description = "Execute a stored procedure with parameters. Returns result sets and output parameters."
-    )]
+    #[tool(description = "Execute a stored procedure with parameters. Returns result sets and output parameters.")]
     pub async fn execute_procedure(
         &self,
-        Parameters(input): Parameters<ExecuteProcedureInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExecuteProcedureInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Executing procedure: {}.{}", input.schema, input.procedure);
 
         // Build the EXEC statement with validated and escaped identifiers
         let escaped_schema = match safe_identifier(&input.schema) {
             Ok(s) => s,
-            Err(e) => return Ok(tool_error(format!("Invalid schema name: {}", e))),
+            Err(e) => return Ok(ToolOutput::error(format!("Invalid schema name: {}", e))),
         };
         let escaped_procedure = match safe_identifier(&input.procedure) {
             Ok(p) => p,
-            Err(e) => return Ok(tool_error(format!("Invalid procedure name: {}", e))),
+            Err(e) => return Ok(ToolOutput::error(format!("Invalid procedure name: {}", e))),
         };
         let proc_name = format!("{}.{}", escaped_schema, escaped_procedure);
 
@@ -233,12 +212,12 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Procedure execution failed: {}", e);
-                return Ok(tool_error(format!("Procedure execution failed: {}", e)));
+                return Ok(ToolOutput::error(format!("Procedure execution failed: {}", e)));
             }
         };
 
         let output = result.to_markdown_table();
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     // =========================================================================
@@ -248,19 +227,16 @@ impl MssqlMcpServer {
     /// Start an asynchronous query execution.
     ///
     /// Returns a session ID that can be used to check status and retrieve results.
-    #[tool(
-        name = "execute_async",
-        description = "Start an asynchronous query execution. Returns a session ID to check status later."
-    )]
+    #[tool(description = "Start an asynchronous query execution. Returns a session ID to check status later.")]
     pub async fn execute_async(
         &self,
-        Parameters(input): Parameters<ExecuteAsyncInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExecuteAsyncInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Starting async query execution");
 
         // Validate the query
         if let Err(e) = self.validate_query(&input.query) {
-            return Ok(tool_error(format!("Query validation failed: {}", e)));
+            return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
         // Create a new session
@@ -269,7 +245,7 @@ impl MssqlMcpServer {
             match state.create_session(input.query.clone(), self.config.session.max_sessions) {
                 Ok(id) => id,
                 Err(e) => {
-                    return Ok(tool_error(format!("Failed to create session: {}", e)));
+                    return Ok(ToolOutput::error(format!("Failed to create session: {}", e)));
                 }
             }
         };
@@ -310,27 +286,24 @@ impl MssqlMcpServer {
             "message": "Query execution started. Use get_session_status to check progress."
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("Session ID: {}", session_id)),
-        )]))
+        ))
     }
 
     /// Get the status of an async query session.
-    #[tool(
-        name = "get_session_status",
-        description = "Get the status and results of an async query session."
-    )]
+    #[tool(description = "Get the status and results of an async query session.")]
     pub async fn get_session_status(
         &self,
-        Parameters(input): Parameters<GetSessionStatusInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: GetSessionStatusInput,
+    ) -> Result<ToolOutput, McpError> {
         let state = self.state.read().await;
 
         let session = match state.get_session(&input.session_id) {
             Some(s) => s,
             None => {
-                return Ok(tool_error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Session not found: {}",
                     input.session_id
                 )));
@@ -364,27 +337,24 @@ impl MssqlMcpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Error serializing response".to_string()),
-        )]))
+        ))
     }
 
     /// Cancel a running async query session.
-    #[tool(
-        name = "cancel_session",
-        description = "Cancel a running async query session."
-    )]
+    #[tool(description = "Cancel a running async query session.")]
     pub async fn cancel_session(
         &self,
-        Parameters(input): Parameters<CancelSessionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: CancelSessionInput,
+    ) -> Result<ToolOutput, McpError> {
         let mut state = self.state.write().await;
 
         let session = match state.get_session_mut(&input.session_id) {
             Some(s) => s,
             None => {
-                return Ok(tool_error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Session not found: {}",
                     input.session_id
                 )));
@@ -392,7 +362,7 @@ impl MssqlMcpServer {
         };
 
         if !session.is_running() {
-            return Ok(tool_error(format!(
+            return Ok(ToolOutput::error(format!(
                 "Session {} is not running (status: {})",
                 input.session_id, session.status
             )));
@@ -407,21 +377,18 @@ impl MssqlMcpServer {
             "message": "Session cancelled successfully"
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Session cancelled".to_string()),
-        )]))
+        ))
     }
 
     /// List all async query sessions.
-    #[tool(
-        name = "list_sessions",
-        description = "List all async query sessions with optional status filter."
-    )]
+    #[tool(description = "List all async query sessions with optional status filter.")]
     pub async fn list_sessions(
         &self,
-        Parameters(input): Parameters<ListSessionsInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ListSessionsInput,
+    ) -> Result<ToolOutput, McpError> {
         let state = self.state.read().await;
 
         let sessions = match input.status.to_lowercase().as_str() {
@@ -438,29 +405,26 @@ impl MssqlMcpServer {
             "sessions": sessions,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Error listing sessions".to_string()),
-        )]))
+        ))
     }
 
     /// Get the results of an async query session.
     ///
     /// Retrieves the results from a completed async query session with formatting options.
-    #[tool(
-        name = "get_session_results",
-        description = "Get the results of a completed async query session with formatting options."
-    )]
+    #[tool(description = "Get the results of a completed async query session with formatting options.")]
     pub async fn get_session_results(
         &self,
-        Parameters(input): Parameters<GetSessionResultsInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: GetSessionResultsInput,
+    ) -> Result<ToolOutput, McpError> {
         let state = self.state.read().await;
 
         let session = match state.get_session(&input.session_id) {
             Some(s) => s,
             None => {
-                return Ok(tool_error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Session not found: {}",
                     input.session_id
                 )));
@@ -469,7 +433,7 @@ impl MssqlMcpServer {
 
         // Check if session is completed
         if session.status != SessionStatus::Completed {
-            return Ok(tool_error(format!(
+            return Ok(ToolOutput::error(format!(
                 "Session {} is not completed (status: {}). Use get_session_status to check progress.",
                 input.session_id, session.status
             )));
@@ -479,7 +443,7 @@ impl MssqlMcpServer {
         let result = match &session.result {
             Some(r) => r,
             None => {
-                return Ok(tool_error("Session completed but no results available"));
+                return Ok(ToolOutput::error("Session completed but no results available"));
             }
         };
 
@@ -523,7 +487,7 @@ impl MssqlMcpServer {
             }
         };
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     // =========================================================================
@@ -533,14 +497,11 @@ impl MssqlMcpServer {
     /// Check database connectivity and health.
     ///
     /// Returns connection status and optionally detailed diagnostics.
-    #[tool(
-        name = "health_check",
-        description = "Test database connectivity and return health status with optional diagnostics."
-    )]
+    #[tool(description = "Test database connectivity and return health status with optional diagnostics.")]
     pub async fn health_check(
         &self,
-        Parameters(input): Parameters<HealthCheckInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: HealthCheckInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Performing health check (detailed: {})", input.detailed);
 
         let start = std::time::Instant::now();
@@ -608,27 +569,24 @@ impl MssqlMcpServer {
         let status_text = if healthy { "healthy" } else { "unhealthy" };
         info!("Health check completed: {} ({}ms)", status_text, latency_ms);
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("Health: {}", status_text)),
-        )]))
+        ))
     }
 
     /// Set the default query timeout.
     ///
     /// Adjusts the default timeout for query execution at runtime.
     /// This affects all subsequent queries that don't specify their own timeout.
-    #[tool(
-        name = "set_timeout",
-        description = "Set the default query timeout in seconds. Affects subsequent query executions."
-    )]
+    #[tool(description = "Set the default query timeout in seconds. Affects subsequent query executions.")]
     pub async fn set_timeout(
         &self,
-        Parameters(input): Parameters<SetTimeoutInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: SetTimeoutInput,
+    ) -> Result<ToolOutput, McpError> {
         // Validate timeout range (1 second to 1 hour)
         if input.timeout_seconds < 1 || input.timeout_seconds > 3600 {
-            return Ok(tool_error(
+            return Ok(ToolOutput::error(
                 "Timeout must be between 1 and 3600 seconds (1 hour)",
             ));
         }
@@ -657,23 +615,20 @@ impl MssqlMcpServer {
             "note": "Default timeout updated. All subsequent queries will use this timeout unless overridden."
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Timeout updated".to_string()),
-        )]))
+        ))
     }
 
     /// Get the current query timeout configuration.
     ///
     /// Returns the current default timeout and related configuration.
-    #[tool(
-        name = "get_timeout",
-        description = "Get the current default query timeout and related configuration."
-    )]
+    #[tool(description = "Get the current default query timeout and related configuration.")]
     pub async fn get_timeout(
         &self,
-        Parameters(input): Parameters<GetTimeoutInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: GetTimeoutInput,
+    ) -> Result<ToolOutput, McpError> {
         let state = self.state.read().await;
         let current_timeout = state.default_timeout();
         let initial_timeout = self.config.query.default_timeout.as_secs();
@@ -693,10 +648,10 @@ impl MssqlMcpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("Current timeout: {}s", current_timeout)),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -707,14 +662,11 @@ impl MssqlMcpServer {
     ///
     /// This tool provides safe execution of queries with parameters,
     /// preventing SQL injection at the protocol level.
-    #[tool(
-        name = "execute_parameterized",
-        description = "Execute a SQL query with parameters. Safer than raw queries as parameters are bound separately."
-    )]
+    #[tool(description = "Execute a SQL query with parameters. Safer than raw queries as parameters are bound separately.")]
     pub async fn execute_parameterized(
         &self,
-        Parameters(input): Parameters<ExecuteParameterizedInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExecuteParameterizedInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Executing parameterized query: {}",
             truncate_for_log(&input.query, 100)
@@ -722,7 +674,7 @@ impl MssqlMcpServer {
 
         // Validate the query structure (without parameters)
         if let Err(e) = self.validate_query(&input.query) {
-            return Ok(tool_error(format!("Query validation failed: {}", e)));
+            return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
         // Build the query with parameterized values
@@ -753,7 +705,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Parameterized query execution failed: {}", e);
-                return Ok(tool_error(format!("Query execution failed: {}", e)));
+                return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
             }
         };
 
@@ -769,7 +721,7 @@ impl MssqlMcpServer {
             OutputFormat::Table => result.to_markdown_table(),
         };
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     // =========================================================================
@@ -777,14 +729,11 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Begin a new database transaction.
-    #[tool(
-        name = "begin_transaction",
-        description = "Start a new database transaction with optional name and isolation level."
-    )]
+    #[tool(description = "Start a new database transaction with optional name and isolation level.")]
     pub async fn begin_transaction(
         &self,
-        Parameters(input): Parameters<BeginTransactionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: BeginTransactionInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Beginning transaction with isolation: {}",
             input.isolation_level
@@ -806,7 +755,7 @@ impl MssqlMcpServer {
             ) {
                 Ok(id) => id,
                 Err(e) => {
-                    return Ok(tool_error(format!("Failed to create transaction: {}", e)));
+                    return Ok(ToolOutput::error(format!("Failed to create transaction: {}", e)));
                 }
             }
         };
@@ -824,7 +773,7 @@ impl MssqlMcpServer {
             // Clean up state on failure
             let mut state = self.state.write().await;
             state.remove_transaction(&transaction_id);
-            return Ok(tool_error(format!("Failed to begin transaction: {}", e)));
+            return Ok(ToolOutput::error(format!("Failed to begin transaction: {}", e)));
         }
 
         info!(
@@ -840,21 +789,18 @@ impl MssqlMcpServer {
             "message": "Transaction started. Use execute_in_transaction to run queries, then commit_transaction or rollback_transaction."
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("Transaction ID: {}", transaction_id)),
-        )]))
+        ))
     }
 
     /// Commit a transaction.
-    #[tool(
-        name = "commit_transaction",
-        description = "Commit a transaction, making all changes permanent."
-    )]
+    #[tool(description = "Commit a transaction, making all changes permanent.")]
     pub async fn commit_transaction(
         &self,
-        Parameters(input): Parameters<CommitTransactionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: CommitTransactionInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Committing transaction: {}", input.transaction_id);
 
         // Check transaction exists and is active, get the name
@@ -862,13 +808,13 @@ impl MssqlMcpServer {
             let state = self.state.read().await;
             match state.get_transaction(&input.transaction_id) {
                 Some(tx) if tx.status != TransactionStatus::Active => {
-                    return Ok(tool_error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Transaction {} is not active (status: {})",
                         input.transaction_id, tx.status
                     )));
                 }
                 None => {
-                    return Ok(tool_error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Transaction not found: {}",
                         input.transaction_id
                     )));
@@ -883,7 +829,7 @@ impl MssqlMcpServer {
             .commit_transaction(&input.transaction_id, tx_name.as_deref())
             .await
         {
-            return Ok(tool_error(format!("Failed to commit transaction: {}", e)));
+            return Ok(ToolOutput::error(format!("Failed to commit transaction: {}", e)));
         }
 
         // Update state
@@ -906,21 +852,18 @@ impl MssqlMcpServer {
             "message": "Transaction committed successfully"
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Transaction committed".to_string()),
-        )]))
+        ))
     }
 
     /// Rollback a transaction.
-    #[tool(
-        name = "rollback_transaction",
-        description = "Rollback a transaction, undoing all changes."
-    )]
+    #[tool(description = "Rollback a transaction, undoing all changes.")]
     pub async fn rollback_transaction(
         &self,
-        Parameters(input): Parameters<RollbackTransactionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: RollbackTransactionInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Rolling back transaction: {}", input.transaction_id);
 
         // Check transaction exists and is active
@@ -928,13 +871,13 @@ impl MssqlMcpServer {
             let state = self.state.read().await;
             match state.get_transaction(&input.transaction_id) {
                 Some(tx) if tx.status != TransactionStatus::Active => {
-                    return Ok(tool_error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Transaction {} is not active (status: {})",
                         input.transaction_id, tx.status
                     )));
                 }
                 None => {
-                    return Ok(tool_error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Transaction not found: {}",
                         input.transaction_id
                     )));
@@ -955,7 +898,7 @@ impl MssqlMcpServer {
         {
             Ok(ended) => ended,
             Err(e) => {
-                return Ok(tool_error(format!("Failed to rollback transaction: {}", e)));
+                return Ok(ToolOutput::error(format!("Failed to rollback transaction: {}", e)));
             }
         };
 
@@ -983,21 +926,18 @@ impl MssqlMcpServer {
             }
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Transaction rolled back".to_string()),
-        )]))
+        ))
     }
 
     /// Execute SQL within a transaction.
-    #[tool(
-        name = "execute_in_transaction",
-        description = "Execute a SQL statement within an active transaction."
-    )]
+    #[tool(description = "Execute a SQL statement within an active transaction.")]
     pub async fn execute_in_transaction(
         &self,
-        Parameters(input): Parameters<ExecuteInTransactionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExecuteInTransactionInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Executing in transaction {}: {}",
             input.transaction_id,
@@ -1009,13 +949,13 @@ impl MssqlMcpServer {
             let state = self.state.read().await;
             match state.get_transaction(&input.transaction_id) {
                 Some(tx) if tx.status != TransactionStatus::Active => {
-                    return Ok(tool_error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Transaction {} is not active (status: {})",
                         input.transaction_id, tx.status
                     )));
                 }
                 None => {
-                    return Ok(tool_error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Transaction not found: {}",
                         input.transaction_id
                     )));
@@ -1026,7 +966,7 @@ impl MssqlMcpServer {
 
         // Validate the query
         if let Err(e) = self.validate_query(&input.query) {
-            return Ok(tool_error(format!("Query validation failed: {}", e)));
+            return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
         // Build query with parameters if provided
@@ -1056,7 +996,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Transaction query failed: {}", e);
-                return Ok(tool_error(format!("Query execution failed: {}", e)));
+                return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
             }
         };
 
@@ -1069,7 +1009,7 @@ impl MssqlMcpServer {
         }
 
         let output = result.to_markdown_table();
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     // =========================================================================
@@ -1080,14 +1020,11 @@ impl MssqlMcpServer {
     ///
     /// Pinned sessions hold a dedicated connection, allowing temp tables (#tables),
     /// session variables, and SET options to persist across multiple queries.
-    #[tool(
-        name = "begin_pinned_session",
-        description = "Start a pinned session with a dedicated connection. Use for temp tables (#tables) and session-scoped state that needs to persist across queries."
-    )]
+    #[tool(description = "Start a pinned session with a dedicated connection. Use for temp tables (#tables) and session-scoped state that needs to persist across queries.")]
     pub async fn begin_pinned_session(
         &self,
-        Parameters(input): Parameters<BeginPinnedSessionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: BeginPinnedSessionInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Beginning pinned session");
 
         // Generate session ID
@@ -1104,7 +1041,7 @@ impl MssqlMcpServer {
         let session_info = match self.session_manager.begin_session(&session_id).await {
             Ok(info) => info,
             Err(e) => {
-                return Ok(tool_error(format!("Failed to begin session: {}", e)));
+                return Ok(ToolOutput::error(format!("Failed to begin session: {}", e)));
             }
         };
 
@@ -1121,21 +1058,18 @@ impl MssqlMcpServer {
             "message": "Pinned session started. Use execute_in_pinned_session for temp tables and session state. Remember to call end_pinned_session when done."
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("Session ID: {}", session_id)),
-        )]))
+        ))
     }
 
     /// Execute SQL within a pinned session.
-    #[tool(
-        name = "execute_in_pinned_session",
-        description = "Execute a SQL statement within a pinned session. Temp tables and session state persist across calls."
-    )]
+    #[tool(description = "Execute a SQL statement within a pinned session. Temp tables and session state persist across calls.")]
     pub async fn execute_in_pinned_session(
         &self,
-        Parameters(input): Parameters<ExecuteInPinnedSessionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExecuteInPinnedSessionInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Executing in pinned session {}: {}",
             input.session_id,
@@ -1144,7 +1078,7 @@ impl MssqlMcpServer {
 
         // Validate the query
         if let Err(e) = self.validate_query(&input.query) {
-            return Ok(tool_error(format!("Query validation failed: {}", e)));
+            return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
         // Execute using SessionManager
@@ -1156,7 +1090,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Session query failed: {}", e);
-                return Ok(tool_error(format!("Query execution failed: {}", e)));
+                return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
             }
         };
 
@@ -1168,24 +1102,21 @@ impl MssqlMcpServer {
             OutputFormat::Table => result.to_markdown_table(),
         };
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     /// End a pinned session and release its connection.
-    #[tool(
-        name = "end_pinned_session",
-        description = "End a pinned session and release its dedicated connection. Any temp tables will be automatically dropped."
-    )]
+    #[tool(description = "End a pinned session and release its dedicated connection. Any temp tables will be automatically dropped.")]
     pub async fn end_pinned_session(
         &self,
-        Parameters(input): Parameters<EndPinnedSessionInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: EndPinnedSessionInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Ending pinned session: {}", input.session_id);
 
         let session_info = match self.session_manager.end_session(&input.session_id).await {
             Ok(info) => info,
             Err(e) => {
-                return Ok(tool_error(format!("Failed to end session: {}", e)));
+                return Ok(ToolOutput::error(format!("Failed to end session: {}", e)));
             }
         };
 
@@ -1202,20 +1133,17 @@ impl MssqlMcpServer {
             "message": "Session ended and connection released"
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| "Session ended".to_string()),
-        )]))
+        ))
     }
 
     /// List all active pinned sessions.
-    #[tool(
-        name = "list_pinned_sessions",
-        description = "List all active pinned sessions with their statistics."
-    )]
+    #[tool(description = "List all active pinned sessions with their statistics.")]
     pub async fn list_pinned_sessions(
         &self,
-        Parameters(input): Parameters<ListPinnedSessionsInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ListPinnedSessionsInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Listing pinned sessions");
 
         let sessions = self.session_manager.list_sessions().await;
@@ -1244,10 +1172,10 @@ impl MssqlMcpServer {
             "sessions": session_list
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("{} sessions", sessions.len())),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -1255,14 +1183,11 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Execute a paginated query.
-    #[tool(
-        name = "execute_paginated",
-        description = "Execute a SQL query with pagination support. Query must include ORDER BY for consistent results."
-    )]
+    #[tool(description = "Execute a SQL query with pagination support. Query must include ORDER BY for consistent results.")]
     pub async fn execute_paginated(
         &self,
-        Parameters(input): Parameters<ExecutePaginatedInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExecutePaginatedInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Executing paginated query: {}",
             truncate_for_log(&input.query, 100)
@@ -1270,13 +1195,13 @@ impl MssqlMcpServer {
 
         // Validate the query
         if let Err(e) = self.validate_query(&input.query) {
-            return Ok(tool_error(format!("Query validation failed: {}", e)));
+            return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
         // Check for ORDER BY clause (required for consistent pagination)
         let query_upper = input.query.to_uppercase();
         if !query_upper.contains("ORDER BY") {
-            return Ok(tool_error(
+            return Ok(ToolOutput::error(
                 "Paginated queries must include an ORDER BY clause for consistent results",
             ));
         }
@@ -1295,7 +1220,7 @@ impl MssqlMcpServer {
                 match decode_cursor(cursor) {
                     Ok(off) => off,
                     Err(e) => {
-                        return Ok(tool_error(format!("Invalid cursor: {}", e)));
+                        return Ok(ToolOutput::error(format!("Invalid cursor: {}", e)));
                     }
                 }
             }
@@ -1312,7 +1237,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Paginated query failed: {}", e);
-                return Ok(tool_error(format!("Query execution failed: {}", e)));
+                return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
             }
         };
 
@@ -1349,12 +1274,12 @@ impl MssqlMcpServer {
             "execution_time_ms": result.execution_time_ms,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response).unwrap_or_else(|e| {
                 warn!("Failed to serialize pagination response: {}", e);
                 format!("Pagination error: {}", e)
             }),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -1362,30 +1287,27 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Switch to a different database.
-    #[tool(
-        name = "switch_database",
-        description = "Switch the connection to a different database on the same server."
-    )]
+    #[tool(description = "Switch the connection to a different database on the same server.")]
     pub async fn switch_database(
         &self,
-        Parameters(input): Parameters<SwitchDatabaseInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: SwitchDatabaseInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Switching to database: {}", input.database);
 
         // Validate database name
         if let Err(e) = validate_identifier(&input.database) {
-            return Ok(tool_error(format!("Invalid database name: {}", e)));
+            return Ok(ToolOutput::error(format!("Invalid database name: {}", e)));
         }
 
         let escaped_db = match safe_identifier(&input.database) {
             Ok(db) => db,
-            Err(e) => return Ok(tool_error(format!("Invalid database name: {}", e))),
+            Err(e) => return Ok(ToolOutput::error(format!("Invalid database name: {}", e))),
         };
 
         // Execute USE statement
         let query = format!("USE {}", escaped_db);
         if let Err(e) = self.executor.execute(&query).await {
-            return Ok(tool_error(format!("Failed to switch database: {}", e)));
+            return Ok(ToolOutput::error(format!("Failed to switch database: {}", e)));
         }
 
         // Update state
@@ -1402,10 +1324,10 @@ impl MssqlMcpServer {
             "message": format!("Now using database: {}", input.database)
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("Switched to {}", input.database)),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -1413,14 +1335,11 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Get index recommendations for a query.
-    #[tool(
-        name = "recommend_indexes",
-        description = "Analyze a SQL query and recommend indexes for better performance."
-    )]
+    #[tool(description = "Analyze a SQL query and recommend indexes for better performance.")]
     pub async fn recommend_indexes(
         &self,
-        Parameters(input): Parameters<RecommendIndexesInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: RecommendIndexesInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Analyzing query for index recommendations: {}",
             truncate_for_log(&input.query, 100)
@@ -1460,7 +1379,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Failed to get missing indexes: {}", e);
-                return Ok(tool_error(format!("Failed to analyze indexes: {}", e)));
+                return Ok(ToolOutput::error(format!("Failed to analyze indexes: {}", e)));
             }
         };
 
@@ -1547,10 +1466,10 @@ impl MssqlMcpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Index analysis failed".to_string()),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -1558,14 +1477,11 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Compare two database schemas.
-    #[tool(
-        name = "compare_schemas",
-        description = "Compare objects between two schemas in the same database."
-    )]
+    #[tool(description = "Compare objects between two schemas in the same database.")]
     pub async fn compare_schemas(
         &self,
-        Parameters(input): Parameters<CompareSchemaInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: CompareSchemaInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Comparing schemas: {} vs {}",
             input.source_schema, input.target_schema
@@ -1573,10 +1489,10 @@ impl MssqlMcpServer {
 
         // Validate schema names
         if let Err(e) = validate_identifier(&input.source_schema) {
-            return Ok(tool_error(format!("Invalid source schema name: {}", e)));
+            return Ok(ToolOutput::error(format!("Invalid source schema name: {}", e)));
         }
         if let Err(e) = validate_identifier(&input.target_schema) {
-            return Ok(tool_error(format!("Invalid target schema name: {}", e)));
+            return Ok(ToolOutput::error(format!("Invalid target schema name: {}", e)));
         }
 
         let include_tables = input.object_types == "all" || input.object_types == "tables";
@@ -1722,21 +1638,18 @@ impl MssqlMcpServer {
             "differences": differences,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Schema comparison failed".to_string()),
-        )]))
+        ))
     }
 
     /// Compare two tables.
-    #[tool(
-        name = "compare_tables",
-        description = "Compare the structure of two tables, including columns, indexes, and constraints."
-    )]
+    #[tool(description = "Compare the structure of two tables, including columns, indexes, and constraints.")]
     pub async fn compare_tables(
         &self,
-        Parameters(input): Parameters<CompareTablesInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: CompareTablesInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Comparing tables: {} vs {}",
             input.source_table, input.target_table
@@ -1788,7 +1701,7 @@ impl MssqlMcpServer {
         let columns_result = match self.executor.execute(&columns_query).await {
             Ok(r) => r,
             Err(e) => {
-                return Ok(tool_error(format!("Failed to compare columns: {}", e)));
+                return Ok(ToolOutput::error(format!("Failed to compare columns: {}", e)));
             }
         };
 
@@ -1818,10 +1731,10 @@ impl MssqlMcpServer {
             "difference_count": column_diffs.len(),
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Table comparison failed".to_string()),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -1829,14 +1742,11 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Sample data from a table.
-    #[tool(
-        name = "sample_data",
-        description = "Get a random or stratified sample of data from a table."
-    )]
+    #[tool(description = "Get a random or stratified sample of data from a table.")]
     pub async fn sample_data(
         &self,
-        Parameters(input): Parameters<SampleDataInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: SampleDataInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Sampling {} rows from {} using method {}",
             input.sample_size, input.table, input.method
@@ -1846,8 +1756,8 @@ impl MssqlMcpServer {
         let (schema, table) = parse_table_name(&input.table)?;
         let escaped_table = format!(
             "{}.{}",
-            safe_identifier(&schema).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
-            safe_identifier(&table).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?
+            safe_identifier(&schema).map_err(|e| McpError::invalid_params("schema", e.to_string()))?,
+            safe_identifier(&table).map_err(|e| McpError::invalid_params("table", e.to_string()))?
         );
 
         let sample_size = input.sample_size.clamp(1, 10000);
@@ -1883,10 +1793,10 @@ impl MssqlMcpServer {
                     Some(col) => {
                         // Validate column name
                         if let Err(e) = validate_identifier(col) {
-                            return Ok(tool_error(format!("Invalid stratify column name: {}", e)));
+                            return Ok(ToolOutput::error(format!("Invalid stratify column name: {}", e)));
                         }
                         let escaped_col = safe_identifier(col)
-                            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+                            .map_err(|e| McpError::invalid_params("stratify_column", e.to_string()))?;
                         format!(
                             r#"
                             SELECT * FROM (
@@ -1904,7 +1814,7 @@ impl MssqlMcpServer {
                         )
                     }
                     None => {
-                        return Ok(tool_error(
+                        return Ok(ToolOutput::error(
                             "Stratified sampling requires stratify_column parameter",
                         ));
                     }
@@ -1923,7 +1833,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Sample query failed: {}", e);
-                return Ok(tool_error(format!("Failed to sample data: {}", e)));
+                return Ok(ToolOutput::error(format!("Failed to sample data: {}", e)));
             }
         };
 
@@ -1936,7 +1846,7 @@ impl MssqlMcpServer {
             OutputFormat::Table => result.to_markdown_table(),
         };
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(ToolOutput::text(output))
     }
 
     // =========================================================================
@@ -1944,14 +1854,11 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Bulk insert data into a table.
-    #[tool(
-        name = "bulk_insert",
-        description = "Insert multiple rows into a table efficiently using batched inserts."
-    )]
+    #[tool(description = "Insert multiple rows into a table efficiently using batched inserts.")]
     pub async fn bulk_insert(
         &self,
-        Parameters(input): Parameters<BulkInsertInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: BulkInsertInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Bulk inserting {} rows into {}",
             input.rows.len(),
@@ -1959,26 +1866,26 @@ impl MssqlMcpServer {
         );
 
         if input.rows.is_empty() {
-            return Ok(tool_error("No rows to insert"));
+            return Ok(ToolOutput::error("No rows to insert"));
         }
 
         if input.columns.is_empty() {
-            return Ok(tool_error("No columns specified"));
+            return Ok(ToolOutput::error("No columns specified"));
         }
 
         // Parse and validate table name
         let (schema, table) = parse_table_name(&input.table)?;
         let escaped_table = format!(
             "{}.{}",
-            safe_identifier(&schema).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
-            safe_identifier(&table).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?
+            safe_identifier(&schema).map_err(|e| McpError::invalid_params("schema", e.to_string()))?,
+            safe_identifier(&table).map_err(|e| McpError::invalid_params("table", e.to_string()))?
         );
 
         // Validate and escape column names
         let escaped_columns: Result<Vec<String>, _> =
             input.columns.iter().map(|c| safe_identifier(c)).collect();
         let escaped_columns =
-            escaped_columns.map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            escaped_columns.map_err(|e| McpError::invalid_params("columns", e.to_string()))?;
 
         let batch_size = input.batch_size.clamp(1, 5000);
         let mut total_inserted = 0;
@@ -2022,26 +1929,23 @@ impl MssqlMcpServer {
             "status": if errors.is_empty() { "success" } else { "partial" },
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| format!("Inserted {} rows", total_inserted)),
-        )]))
+        ))
     }
 
     /// Export query results to various formats.
-    #[tool(
-        name = "export_data",
-        description = "Export query results in CSV, JSON, or JSON Lines format."
-    )]
+    #[tool(description = "Export query results in CSV, JSON, or JSON Lines format.")]
     pub async fn export_data(
         &self,
-        Parameters(input): Parameters<ExportDataInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: ExportDataInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Exporting data: {}", truncate_for_log(&input.query, 100));
 
         // Validate query
         if let Err(e) = self.validate_query(&input.query) {
-            return Ok(tool_error(format!("Query validation failed: {}", e)));
+            return Ok(ToolOutput::error(format!("Query validation failed: {}", e)));
         }
 
         let max_rows = input
@@ -2056,7 +1960,7 @@ impl MssqlMcpServer {
             Ok(r) => r,
             Err(e) => {
                 warn!("Export query failed: {}", e);
-                return Ok(tool_error(format!("Query execution failed: {}", e)));
+                return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
             }
         };
 
@@ -2115,12 +2019,12 @@ impl MssqlMcpServer {
             "data": output,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response).unwrap_or_else(|e| {
                 warn!("Failed to serialize export response: {}", e);
                 format!("Export failed: {}", e)
             }),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -2128,14 +2032,11 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Get server performance metrics.
-    #[tool(
-        name = "get_metrics",
-        description = "Get SQL Server performance metrics including connections, queries, and memory usage."
-    )]
+    #[tool(description = "Get SQL Server performance metrics including connections, queries, and memory usage.")]
     pub async fn get_metrics(
         &self,
-        Parameters(input): Parameters<GetMetricsInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: GetMetricsInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!(
             "Getting server metrics for categories: {}",
             input.categories
@@ -2262,21 +2163,18 @@ impl MssqlMcpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&metrics)
                 .unwrap_or_else(|_| "Failed to get metrics".to_string()),
-        )]))
+        ))
     }
 
     /// Analyze a query for performance issues.
-    #[tool(
-        name = "analyze_query",
-        description = "Analyze a SQL query for performance issues and optimization opportunities."
-    )]
+    #[tool(description = "Analyze a SQL query for performance issues and optimization opportunities.")]
     pub async fn analyze_query(
         &self,
-        Parameters(input): Parameters<AnalyzeQueryInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: AnalyzeQueryInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Analyzing query: {}", truncate_for_log(&input.query, 100));
 
         let mut analysis = json!({
@@ -2395,10 +2293,10 @@ impl MssqlMcpServer {
 
         analysis["warnings"] = json!(warnings);
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&analysis)
                 .unwrap_or_else(|_| "Analysis failed".to_string()),
-        )]))
+        ))
     }
 
     // =========================================================================
@@ -2409,14 +2307,11 @@ impl MssqlMcpServer {
     ///
     /// Returns information about the connection pool including
     /// active connections, idle connections, and pool configuration.
-    #[tool(
-        name = "get_pool_metrics",
-        description = "Get connection pool metrics including active connections, idle connections, and pool health."
-    )]
+    #[tool(description = "Get connection pool metrics including active connections, idle connections, and pool health.")]
     pub async fn get_pool_metrics(
         &self,
-        Parameters(input): Parameters<GetPoolMetricsInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: GetPoolMetricsInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Getting connection pool metrics");
 
         let pool_status = self.pool.status();
@@ -2464,24 +2359,21 @@ impl MssqlMcpServer {
             pool_status.in_use, pool_status.total
         );
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Failed to get pool metrics".to_string()),
-        )]))
+        ))
     }
 
     /// Get internal server metrics.
     ///
     /// Returns metrics collected by the server including query counts,
     /// latency statistics, cache performance, and transaction counts.
-    #[tool(
-        name = "get_internal_metrics",
-        description = "Get internal server metrics including query counts, latency, cache stats, and transaction counts."
-    )]
+    #[tool(description = "Get internal server metrics including query counts, latency, cache stats, and transaction counts.")]
     pub async fn get_internal_metrics(
         &self,
-        Parameters(input): Parameters<GetInternalMetricsInput>,
-    ) -> Result<CallToolResult, ErrorData> {
+        input: GetInternalMetricsInput,
+    ) -> Result<ToolOutput, McpError> {
         debug!("Getting internal server metrics");
 
         let snapshot = self.metrics.snapshot();
@@ -2522,10 +2414,10 @@ impl MssqlMcpServer {
             snapshot.success_rate()
         );
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(ToolOutput::text(
             serde_json::to_string_pretty(&response)
                 .unwrap_or_else(|_| "Failed to get internal metrics".to_string()),
-        )]))
+        ))
     }
 }
 
@@ -2575,7 +2467,7 @@ fn format_parameter_value(value: &serde_json::Value) -> String {
 fn build_parameterized_query(
     query: &str,
     parameters: &std::collections::HashMap<String, serde_json::Value>,
-) -> Result<(String, String, String), ErrorData> {
+) -> Result<(String, String, String), McpError> {
     if parameters.is_empty() {
         return Ok((query.to_string(), String::new(), String::new()));
     }
@@ -2654,13 +2546,13 @@ fn decode_cursor(cursor: &str) -> Result<usize, String> {
 }
 
 /// Parse a table name in schema.table format.
-fn parse_table_name(table_ref: &str) -> Result<(String, String), ErrorData> {
+fn parse_table_name(table_ref: &str) -> Result<(String, String), McpError> {
     match parse_qualified_name(table_ref) {
         Ok((Some(schema), table)) => Ok((schema, table)),
         Ok((None, table)) => Ok(("dbo".to_string(), table)),
-        Err(e) => Err(ErrorData::invalid_params(
+        Err(e) => Err(McpError::invalid_params(
+            "table",
             format!("Invalid table name '{}': {}", table_ref, e),
-            None,
         )),
     }
 }

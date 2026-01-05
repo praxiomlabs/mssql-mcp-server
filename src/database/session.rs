@@ -9,7 +9,7 @@ use super::auth::{create_connection, truncate_for_log, RawConnection};
 use crate::config::DatabaseConfig;
 use crate::database::query::{ColumnInfo, QueryResult, ResultRow};
 use crate::database::types::TypeMapper;
-use crate::error::McpError;
+use crate::error::ServerError;
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,19 +66,19 @@ impl SessionManager {
     }
 
     /// Create a new raw connection using the database configuration.
-    async fn create_session_connection(&self) -> Result<RawConnection, McpError> {
+    async fn create_session_connection(&self) -> Result<RawConnection, ServerError> {
         create_connection(&self.db_config, Some("session")).await
     }
 
     /// Begin a new pinned session.
     ///
     /// Returns the session ID if successful.
-    pub async fn begin_session(&self, session_id: &str) -> Result<SessionInfo, McpError> {
+    pub async fn begin_session(&self, session_id: &str) -> Result<SessionInfo, ServerError> {
         // Check if session already exists
         {
             let connections = self.connections.lock().await;
             if connections.contains_key(session_id) {
-                return Err(McpError::Session(format!(
+                return Err(ServerError::Session(format!(
                     "Session already exists: {}",
                     session_id
                 )));
@@ -108,13 +108,13 @@ impl SessionManager {
         &self,
         session_id: &str,
         query: &str,
-    ) -> Result<QueryResult, McpError> {
+    ) -> Result<QueryResult, ServerError> {
         let start = Instant::now();
 
         let mut connections = self.connections.lock().await;
         let (conn, info) = connections
             .get_mut(session_id)
-            .ok_or_else(|| McpError::Session(format!("Session not found: {}", session_id)))?;
+            .ok_or_else(|| ServerError::Session(format!("Session not found: {}", session_id)))?;
 
         // Update last activity and query count
         info.last_activity = Instant::now();
@@ -130,10 +130,10 @@ impl SessionManager {
         let stream = conn
             .query(query, &[])
             .await
-            .map_err(|e| McpError::query_error(format!("Query execution failed: {}", e)))?;
+            .map_err(|e| ServerError::query_error(format!("Query execution failed: {}", e)))?;
 
         let rows: Vec<mssql_client::Row> = stream.try_collect().await.map_err(|e| {
-            McpError::query_error(format!("Failed to collect query results: {}", e))
+            ServerError::query_error(format!("Failed to collect query results: {}", e))
         })?;
 
         // Convert results
@@ -149,11 +149,11 @@ impl SessionManager {
     }
 
     /// End a session and release its connection.
-    pub async fn end_session(&self, session_id: &str) -> Result<SessionInfo, McpError> {
+    pub async fn end_session(&self, session_id: &str) -> Result<SessionInfo, ServerError> {
         let mut connections = self.connections.lock().await;
         let (mut conn, info) = connections
             .remove(session_id)
-            .ok_or_else(|| McpError::Session(format!("Session not found: {}", session_id)))?;
+            .ok_or_else(|| ServerError::Session(format!("Session not found: {}", session_id)))?;
 
         // Clean up any temp tables or transactions before closing
         // This is best-effort - we don't fail if cleanup fails

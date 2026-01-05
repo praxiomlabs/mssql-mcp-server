@@ -2,7 +2,7 @@
 
 use crate::database::types::SqlValue;
 use crate::database::{ConnectionPool, QueryExecutor, QueryResult, ResultRow};
-use crate::error::McpError;
+use crate::error::ServerError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -138,7 +138,7 @@ impl MetadataQueries {
     }
 
     /// Get server information.
-    pub async fn get_server_info(&self) -> Result<ServerInfo, McpError> {
+    pub async fn get_server_info(&self) -> Result<ServerInfo, ServerError> {
         // Note: SERVERPROPERTY() returns sql_variant which needs explicit casting.
         // We must cast all SERVERPROPERTY results to explicit types.
         let query = r#"
@@ -155,7 +155,7 @@ impl MetadataQueries {
         let result = self.executor.execute(query).await?;
 
         if result.rows.is_empty() {
-            return Err(McpError::internal("Failed to get server info"));
+            return Err(ServerError::internal("Failed to get server info"));
         }
 
         let row = &result.rows[0];
@@ -172,7 +172,7 @@ impl MetadataQueries {
     }
 
     /// List all databases on the server.
-    pub async fn list_databases(&self) -> Result<Vec<DatabaseInfo>, McpError> {
+    pub async fn list_databases(&self) -> Result<Vec<DatabaseInfo>, ServerError> {
         let query = r#"
             SELECT
                 name,
@@ -205,7 +205,7 @@ impl MetadataQueries {
     }
 
     /// List all schemas in the current database.
-    pub async fn list_schemas(&self) -> Result<Vec<String>, McpError> {
+    pub async fn list_schemas(&self) -> Result<Vec<String>, ServerError> {
         let query = r#"
             SELECT schema_name
             FROM INFORMATION_SCHEMA.SCHEMATA
@@ -223,7 +223,7 @@ impl MetadataQueries {
     }
 
     /// List tables in a schema.
-    pub async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>, McpError> {
+    pub async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -269,7 +269,7 @@ impl MetadataQueries {
         &self,
         schema: &str,
         table: &str,
-    ) -> Result<Vec<ColumnInfo>, McpError> {
+    ) -> Result<Vec<ColumnInfo>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -313,7 +313,7 @@ impl MetadataQueries {
     }
 
     /// List views in a schema.
-    pub async fn list_views(&self, schema: Option<&str>) -> Result<Vec<ViewInfo>, McpError> {
+    pub async fn list_views(&self, schema: Option<&str>) -> Result<Vec<ViewInfo>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -351,7 +351,7 @@ impl MetadataQueries {
     pub async fn list_procedures(
         &self,
         schema: Option<&str>,
-    ) -> Result<Vec<ProcedureInfo>, McpError> {
+    ) -> Result<Vec<ProcedureInfo>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -389,7 +389,7 @@ impl MetadataQueries {
         &self,
         schema: &str,
         procedure: &str,
-    ) -> Result<Option<String>, McpError> {
+    ) -> Result<Option<String>, ServerError> {
         let query = format!(
             r#"
             SELECT m.definition
@@ -417,7 +417,7 @@ impl MetadataQueries {
         &self,
         schema: &str,
         procedure: &str,
-    ) -> Result<Vec<ProcedureParameter>, McpError> {
+    ) -> Result<Vec<ProcedureParameter>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -464,7 +464,7 @@ impl MetadataQueries {
     pub async fn list_functions(
         &self,
         schema: Option<&str>,
-    ) -> Result<Vec<FunctionInfo>, McpError> {
+    ) -> Result<Vec<FunctionInfo>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -519,7 +519,7 @@ impl MetadataQueries {
         &self,
         schema: &str,
         function: &str,
-    ) -> Result<Vec<FunctionParameter>, McpError> {
+    ) -> Result<Vec<FunctionParameter>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -557,7 +557,7 @@ impl MetadataQueries {
     }
 
     /// List triggers in a schema.
-    pub async fn list_triggers(&self, schema: Option<&str>) -> Result<Vec<TriggerInfo>, McpError> {
+    pub async fn list_triggers(&self, schema: Option<&str>) -> Result<Vec<TriggerInfo>, ServerError> {
         let query = format!(
             r#"
             SELECT
@@ -608,7 +608,7 @@ impl MetadataQueries {
     }
 
     /// Execute a raw query (passthrough for QueryExecutor).
-    pub async fn execute_query(&self, query: &str) -> Result<QueryResult, McpError> {
+    pub async fn execute_query(&self, query: &str) -> Result<QueryResult, ServerError> {
         self.executor.execute(query).await
     }
 }

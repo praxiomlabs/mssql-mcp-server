@@ -7,7 +7,7 @@
 //! - Azure AD authentication (service principal with client credentials)
 
 use crate::config::{AuthConfig, DatabaseConfig};
-use crate::error::McpError;
+use crate::error::ServerError;
 use mssql_client::{Client, Config, Credentials, Ready};
 use tracing::debug;
 
@@ -22,7 +22,7 @@ const AZURE_SQL_RESOURCE: &str = "https://database.windows.net/";
 /// Build credentials based on AuthConfig.
 ///
 /// For Azure AD, this acquires a fresh access token using the service principal credentials.
-pub async fn build_credentials(auth: &AuthConfig) -> Result<Credentials, McpError> {
+pub async fn build_credentials(auth: &AuthConfig) -> Result<Credentials, ServerError> {
     match auth {
         AuthConfig::SqlServer { username, password } => {
             Ok(Credentials::sql_server(username.clone(), password.clone()))
@@ -31,7 +31,7 @@ pub async fn build_credentials(auth: &AuthConfig) -> Result<Credentials, McpErro
         AuthConfig::Windows => {
             // Note: Integrated authentication requires the 'integrated-auth' feature
             // on mssql-client, which is platform-specific
-            Err(McpError::config(
+            Err(ServerError::config(
                 "Windows integrated authentication requires platform-specific setup. \
                  Consider using SQL Server or Azure AD authentication.",
             ))
@@ -50,7 +50,7 @@ pub async fn build_credentials(auth: &AuthConfig) -> Result<Credentials, McpErro
             {
                 // Silence unused variable warnings
                 let _ = (client_id, client_secret, tenant_id);
-                Err(McpError::config(
+                Err(ServerError::config(
                     "Azure AD authentication requires the 'azure-auth' feature. \
                      Rebuild with: cargo build --features azure-auth",
                 ))
@@ -65,7 +65,7 @@ async fn acquire_azure_ad_token(
     client_id: &str,
     client_secret: &str,
     tenant_id: &str,
-) -> Result<String, McpError> {
+) -> Result<String, ServerError> {
     use azure_core::credentials::{Secret, TokenCredential};
     use azure_identity::ClientSecretCredential;
 
@@ -81,16 +81,14 @@ async fn acquire_azure_ad_token(
         Secret::new(client_secret.to_string()),
         None, // Use default options
     )
-    .map_err(|e| McpError::Authentication(format!("Failed to create credential: {}", e)))?;
+    .map_err(|e| ServerError::auth(format!("Failed to create credential: {}", e)))?;
 
     // Request token for Azure SQL Database resource
     // The scope for Azure SQL is the resource URL with /.default suffix
     let token_response = credential
         .get_token(&[AZURE_SQL_RESOURCE], None)
         .await
-        .map_err(|e| {
-            McpError::Authentication(format!("Failed to acquire Azure AD token: {}", e))
-        })?;
+        .map_err(|e| ServerError::auth(format!("Failed to acquire Azure AD token: {}", e)))?;
 
     debug!("Azure AD token acquired successfully");
     Ok(token_response.token.secret().to_string())
@@ -100,7 +98,7 @@ async fn acquire_azure_ad_token(
 ///
 /// This sets up the connection configuration including host, port, database,
 /// encryption settings, and authentication credentials.
-pub async fn create_config(db_config: &DatabaseConfig) -> Result<Config, McpError> {
+pub async fn create_config(db_config: &DatabaseConfig) -> Result<Config, ServerError> {
     let credentials = build_credentials(&db_config.auth).await?;
 
     let mut config = Config::new()
@@ -125,7 +123,7 @@ pub async fn create_config(db_config: &DatabaseConfig) -> Result<Config, McpErro
 pub async fn create_config_with_suffix(
     db_config: &DatabaseConfig,
     suffix: &str,
-) -> Result<Config, McpError> {
+) -> Result<Config, ServerError> {
     let credentials = build_credentials(&db_config.auth).await?;
 
     let app_name = format!("{}-{}", db_config.application_name, suffix);
@@ -158,7 +156,7 @@ pub async fn create_config_with_suffix(
 pub async fn create_connection(
     db_config: &DatabaseConfig,
     app_name_suffix: Option<&str>,
-) -> Result<RawConnection, McpError> {
+) -> Result<RawConnection, ServerError> {
     // Create config with optional suffix
     let config = match app_name_suffix {
         Some(suffix) => create_config_with_suffix(db_config, suffix).await?,
@@ -171,7 +169,7 @@ pub async fn create_connection(
 
     let client = Client::connect(config)
         .await
-        .map_err(|e| McpError::connection(format!("Failed to connect to SQL Server: {}", e)))?;
+        .map_err(|e| ServerError::connection(format!("Failed to connect to SQL Server: {}", e)))?;
 
     debug!("Connection established successfully");
     Ok(client)

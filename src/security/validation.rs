@@ -1,6 +1,6 @@
 //! Query validation for different security modes.
 
-use crate::error::McpError;
+use crate::error::ServerError;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -165,10 +165,10 @@ impl QueryValidator {
     }
 
     /// Validate a query against the current mode.
-    pub fn validate(&self, query: &str) -> Result<ValidationResult, McpError> {
+    pub fn validate(&self, query: &str) -> Result<ValidationResult, ServerError> {
         // Check query length
         if query.len() > self.max_length {
-            return Err(McpError::validation(format!(
+            return Err(ServerError::validation(format!(
                 "Query exceeds maximum length of {} bytes",
                 self.max_length
             )));
@@ -194,7 +194,7 @@ impl QueryValidator {
         &self,
         _query: &str,
         query_type: QueryType,
-    ) -> Result<ValidationResult, McpError> {
+    ) -> Result<ValidationResult, ServerError> {
         if query_type.is_read() {
             Ok(ValidationResult {
                 valid: true,
@@ -202,7 +202,7 @@ impl QueryValidator {
                 message: None,
             })
         } else {
-            Err(McpError::validation(format!(
+            Err(ServerError::validation(format!(
                 "Query type {:?} is not allowed in read-only mode. Only SELECT queries are permitted.",
                 query_type
             )))
@@ -214,10 +214,10 @@ impl QueryValidator {
         &self,
         query: &str,
         query_type: QueryType,
-    ) -> Result<ValidationResult, McpError> {
+    ) -> Result<ValidationResult, ServerError> {
         // Block DDL operations
         if query_type.is_ddl() {
-            return Err(McpError::validation(format!(
+            return Err(ServerError::validation(format!(
                 "Query type {:?} is not allowed in standard mode. DDL operations are blocked.",
                 query_type
             )));
@@ -225,7 +225,7 @@ impl QueryValidator {
 
         // Block permission operations
         if matches!(query_type, QueryType::Grant | QueryType::Revoke) {
-            return Err(McpError::validation(
+            return Err(ServerError::validation(
                 "Permission operations (GRANT/REVOKE) are not allowed in standard mode",
             ));
         }
@@ -234,7 +234,7 @@ impl QueryValidator {
         if query_type == QueryType::Execute {
             // Allow sp_help, sp_columns, sp_tables (metadata procedures)
             if !SAFE_EXEC_PATTERN.is_match(query) {
-                return Err(McpError::validation(
+                return Err(ServerError::validation(
                     "Arbitrary EXEC/EXECUTE is not allowed in standard mode",
                 ));
             }
@@ -243,7 +243,7 @@ impl QueryValidator {
         // Check for dangerous keywords
         for (pattern, keyword) in DANGEROUS_KEYWORDS.iter() {
             if pattern.is_match(query) {
-                return Err(McpError::validation(format!(
+                return Err(ServerError::validation(format!(
                     "Dangerous keyword '{}' is not allowed in standard mode",
                     keyword
                 )));

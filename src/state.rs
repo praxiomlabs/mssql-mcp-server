@@ -1,7 +1,7 @@
 //! Session state management for async query sessions and transactions.
 
 use crate::database::QueryResult;
-use crate::error::McpError;
+use crate::error::ServerError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -379,11 +379,11 @@ impl SessionState {
         &mut self,
         query: String,
         max_sessions: usize,
-    ) -> Result<String, McpError> {
+    ) -> Result<String, ServerError> {
         // Check if we've hit the session limit
         let running_count = self.sessions.values().filter(|s| s.is_running()).count();
         if running_count >= max_sessions {
-            return Err(McpError::Session(format!(
+            return Err(ServerError::Session(format!(
                 "Maximum concurrent sessions ({}) reached",
                 max_sessions
             )));
@@ -456,11 +456,11 @@ impl SessionState {
         name: Option<String>,
         isolation_level: IsolationLevel,
         max_transactions: usize,
-    ) -> Result<String, McpError> {
+    ) -> Result<String, ServerError> {
         // Check if we've hit the transaction limit
         let active_count = self.transactions.values().filter(|t| t.is_active()).count();
         if active_count >= max_transactions {
-            return Err(McpError::Session(format!(
+            return Err(ServerError::Session(format!(
                 "Maximum concurrent transactions ({}) reached",
                 max_transactions
             )));

@@ -1,6 +1,6 @@
 //! Tool input types with JSON Schema generation.
 
-use schemars::JsonSchema;
+use mcpkit::ToolInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use std::str::FromStr;
 /// Output format for query results.
 ///
 /// This enum provides type-safe handling of output formats instead of raw strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     /// Markdown table format (default).
@@ -30,6 +30,16 @@ impl OutputFormat {
             OutputFormat::Json => "json",
             OutputFormat::Csv => "csv",
         }
+    }
+
+    /// Generate JSON Schema for this type.
+    pub fn tool_input_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "string",
+            "enum": ["table", "json", "csv"],
+            "default": "table",
+            "description": "Output format: 'table' (markdown), 'json', or 'csv'"
+        })
     }
 }
 
@@ -71,7 +81,7 @@ impl std::error::Error for InvalidOutputFormatError {}
 /// Export format for bulk data operations.
 ///
 /// Similar to OutputFormat but includes additional formats suitable for data export.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     /// CSV format (default).
@@ -91,6 +101,16 @@ impl ExportFormat {
             ExportFormat::Json => "json",
             ExportFormat::JsonLines => "json_lines",
         }
+    }
+
+    /// Generate JSON Schema for this type.
+    pub fn tool_input_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "string",
+            "enum": ["csv", "json", "json_lines"],
+            "default": "csv",
+            "description": "Export format: 'csv', 'json', or 'json_lines'"
+        })
     }
 }
 
@@ -130,52 +150,40 @@ impl fmt::Display for InvalidExportFormatError {
 impl std::error::Error for InvalidExportFormatError {}
 
 /// Input for the `execute_query` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecuteQueryInput {
-    /// The SQL query to execute.
-    #[schemars(description = "SQL query to execute")]
+    /// SQL query to execute.
     pub query: String,
 
-    /// Maximum number of rows to return (optional, uses server default if not specified).
+    /// Maximum number of rows to return (default: server configured limit).
     #[serde(default)]
-    #[schemars(
-        description = "Maximum number of rows to return (default: server configured limit)"
-    )]
     pub max_rows: Option<usize>,
 
-    /// Query timeout in seconds (optional, uses server default if not specified).
+    /// Query timeout in seconds (default: server configured timeout).
     #[serde(default)]
-    #[schemars(description = "Query timeout in seconds (default: server configured timeout)")]
     pub timeout_seconds: Option<u64>,
 
-    /// Output format for query results.
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
     #[serde(default)]
-    #[schemars(
-        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
-    )]
     pub format: OutputFormat,
 }
 
 /// Input for the `execute_procedure` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecuteProcedureInput {
-    /// Schema name of the stored procedure (default: dbo).
+    /// Schema name (default: dbo).
     #[serde(default = "default_schema")]
-    #[schemars(description = "Schema name (default: dbo)")]
     pub schema: String,
 
-    /// Name of the stored procedure.
-    #[schemars(description = "Name of the stored procedure to execute")]
+    /// Name of the stored procedure to execute.
     pub procedure: String,
 
-    /// Parameters to pass to the procedure as a JSON object.
+    /// Parameters as key-value pairs.
     #[serde(default)]
-    #[schemars(description = "Parameters as key-value pairs")]
     pub parameters: HashMap<String, serde_json::Value>,
 
-    /// Query timeout in seconds.
+    /// Execution timeout in seconds.
     #[serde(default)]
-    #[schemars(description = "Execution timeout in seconds")]
     pub timeout_seconds: Option<u64>,
 }
 
@@ -184,36 +192,28 @@ fn default_schema() -> String {
 }
 
 /// Input for the `execute_async` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecuteAsyncInput {
-    /// The SQL query to execute asynchronously.
-    #[schemars(description = "SQL query to execute asynchronously")]
+    /// SQL query to execute asynchronously.
     pub query: String,
 
     /// Maximum number of rows to return.
     #[serde(default)]
-    #[schemars(description = "Maximum number of rows to return")]
     pub max_rows: Option<usize>,
 
-    /// Optional per-query timeout in seconds.
-    /// Overrides the global timeout for this query only.
+    /// Per-query timeout in seconds. Overrides the global timeout for this query.
     #[serde(default)]
-    #[schemars(
-        description = "Per-query timeout in seconds. Overrides the global timeout for this query."
-    )]
     pub timeout_seconds: Option<u64>,
 }
 
 /// Input for the `get_session_status` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct GetSessionStatusInput {
-    /// Session ID returned from execute_async.
-    #[schemars(description = "Session ID from execute_async")]
+    /// Session ID from execute_async.
     pub session_id: String,
 
-    /// Whether to include query results if completed.
+    /// Include query results if completed (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Include query results if completed (default: true)")]
     pub include_results: bool,
 }
 
@@ -222,23 +222,20 @@ fn default_true() -> bool {
 }
 
 /// Input for the `cancel_session` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct CancelSessionInput {
     /// Session ID to cancel.
-    #[schemars(description = "Session ID to cancel")]
     pub session_id: String,
 }
 
 /// Input for the `explain_query` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExplainQueryInput {
-    /// The SQL query to explain.
-    #[schemars(description = "SQL query to analyze")]
+    /// SQL query to analyze.
     pub query: String,
 
-    /// Type of plan: "estimated" or "actual".
+    /// Plan type: 'estimated' or 'actual' (default: estimated).
     #[serde(default = "default_plan_type")]
-    #[schemars(description = "Plan type: 'estimated' or 'actual' (default: estimated)")]
     pub plan_type: String,
 }
 
@@ -247,13 +244,10 @@ fn default_plan_type() -> String {
 }
 
 /// Input for the `list_sessions` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ListSessionsInput {
-    /// Filter by status: "running", "completed", "failed", "cancelled", or "all".
+    /// Filter by status: 'running', 'completed', 'failed', 'cancelled', or 'all' (default: all).
     #[serde(default = "default_status_filter")]
-    #[schemars(
-        description = "Filter by status: 'running', 'completed', 'failed', 'cancelled', or 'all' (default: all)"
-    )]
     pub status: String,
 }
 
@@ -262,48 +256,40 @@ fn default_status_filter() -> String {
 }
 
 /// Input for the `health_check` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct HealthCheckInput {
-    /// Whether to include detailed diagnostics.
+    /// Include detailed diagnostics (pool stats, server version, etc.).
     #[serde(default)]
-    #[schemars(description = "Include detailed diagnostics (pool stats, server version, etc.)")]
     pub detailed: bool,
 }
 
 /// Input for the `set_timeout` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct SetTimeoutInput {
-    /// New default timeout in seconds.
-    #[schemars(description = "New default query timeout in seconds (1-3600)")]
+    /// New default query timeout in seconds (1-3600).
     pub timeout_seconds: u64,
 }
 
 /// Input for the `get_timeout` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct GetTimeoutInput {
-    /// Include timeout history if available.
+    /// Include additional timeout configuration details.
     #[serde(default)]
-    #[schemars(description = "Include additional timeout configuration details")]
     pub detailed: bool,
 }
 
 /// Input for the `get_session_results` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct GetSessionResultsInput {
-    /// Session ID returned from execute_async.
-    #[schemars(description = "Session ID from execute_async")]
+    /// Session ID from execute_async.
     pub session_id: String,
 
-    /// Output format for query results.
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
     #[serde(default)]
-    #[schemars(
-        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
-    )]
     pub format: OutputFormat,
 
-    /// Maximum number of rows to return from the results.
+    /// Maximum rows to return (default: all available).
     #[serde(default)]
-    #[schemars(description = "Maximum rows to return (default: all available)")]
     pub max_rows: Option<usize>,
 }
 
@@ -312,31 +298,21 @@ pub struct GetSessionResultsInput {
 // =========================================================================
 
 /// Input for the `execute_parameterized` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecuteParameterizedInput {
-    /// The SQL query with parameter placeholders (@p1, @p2, etc. or named @param).
-    #[schemars(description = "SQL query with parameter placeholders (@p1, @p2, @name, etc.)")]
+    /// SQL query with parameter placeholders (@p1, @p2, @name, etc.).
     pub query: String,
 
-    /// Parameters as key-value pairs (parameter name to value).
+    /// Parameters as key-value pairs. Keys are parameter names (with or without @), values are the parameter values.
     #[serde(default)]
-    #[schemars(
-        description = "Parameters as key-value pairs. Keys are parameter names (with or without @), values are the parameter values."
-    )]
     pub parameters: HashMap<String, Value>,
 
-    /// Maximum number of rows to return.
+    /// Maximum number of rows to return (default: server configured limit).
     #[serde(default)]
-    #[schemars(
-        description = "Maximum number of rows to return (default: server configured limit)"
-    )]
     pub max_rows: Option<usize>,
 
-    /// Output format for query results.
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
     #[serde(default)]
-    #[schemars(
-        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
-    )]
     pub format: OutputFormat,
 }
 
@@ -345,18 +321,14 @@ pub struct ExecuteParameterizedInput {
 // =========================================================================
 
 /// Input for the `begin_transaction` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct BeginTransactionInput {
-    /// Optional transaction name.
+    /// Optional name for the transaction.
     #[serde(default)]
-    #[schemars(description = "Optional name for the transaction")]
     pub name: Option<String>,
 
-    /// Isolation level for the transaction.
+    /// Transaction isolation level: 'read_uncommitted', 'read_committed', 'repeatable_read', 'serializable', 'snapshot' (default: read_committed).
     #[serde(default = "default_isolation_level")]
-    #[schemars(
-        description = "Transaction isolation level: 'read_uncommitted', 'read_committed', 'repeatable_read', 'serializable', 'snapshot' (default: read_committed)"
-    )]
     pub isolation_level: String,
 }
 
@@ -365,42 +337,34 @@ fn default_isolation_level() -> String {
 }
 
 /// Input for the `commit_transaction` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct CommitTransactionInput {
-    /// Transaction ID returned from begin_transaction.
-    #[schemars(description = "Transaction ID from begin_transaction")]
+    /// Transaction ID from begin_transaction.
     pub transaction_id: String,
 }
 
 /// Input for the `rollback_transaction` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct RollbackTransactionInput {
-    /// Transaction ID returned from begin_transaction.
-    #[schemars(description = "Transaction ID from begin_transaction")]
+    /// Transaction ID from begin_transaction.
     pub transaction_id: String,
 
-    /// Optional savepoint name to rollback to.
+    /// Optional savepoint name to rollback to (if not specified, rolls back entire transaction).
     #[serde(default)]
-    #[schemars(
-        description = "Optional savepoint name to rollback to (if not specified, rolls back entire transaction)"
-    )]
     pub savepoint: Option<String>,
 }
 
 /// Input for the `execute_in_transaction` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecuteInTransactionInput {
-    /// Transaction ID returned from begin_transaction.
-    #[schemars(description = "Transaction ID from begin_transaction")]
+    /// Transaction ID from begin_transaction.
     pub transaction_id: String,
 
-    /// The SQL statement to execute within the transaction.
-    #[schemars(description = "SQL statement to execute within the transaction")]
+    /// SQL statement to execute within the transaction.
     pub query: String,
 
-    /// Parameters for parameterized query execution.
+    /// Parameters as key-value pairs for parameterized execution.
     #[serde(default)]
-    #[schemars(description = "Parameters as key-value pairs for parameterized execution")]
     pub parameters: HashMap<String, Value>,
 }
 
@@ -409,31 +373,21 @@ pub struct ExecuteInTransactionInput {
 // =========================================================================
 
 /// Input for the `execute_paginated` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecutePaginatedInput {
-    /// The SQL query to paginate (must include ORDER BY clause).
-    #[schemars(
-        description = "SQL query to paginate (must include ORDER BY clause for consistent ordering)"
-    )]
+    /// SQL query to paginate (must include ORDER BY clause for consistent ordering).
     pub query: String,
 
-    /// Number of rows per page.
+    /// Number of rows per page (default: 100, max: 10000).
     #[serde(default = "default_page_size")]
-    #[schemars(description = "Number of rows per page (default: 100, max: 10000)")]
     pub page_size: usize,
 
-    /// Page number (1-based) or cursor from previous result.
+    /// Page number (1-based) for offset pagination, or cursor token from previous result.
     #[serde(default)]
-    #[schemars(
-        description = "Page number (1-based) for offset pagination, or cursor token from previous result"
-    )]
     pub page: Option<PaginationPosition>,
 
-    /// Output format for query results.
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
     #[serde(default)]
-    #[schemars(
-        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
-    )]
     pub format: OutputFormat,
 }
 
@@ -442,7 +396,7 @@ fn default_page_size() -> usize {
 }
 
 /// Pagination position - either page number or cursor.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PaginationPosition {
     /// Page number (1-based).
@@ -451,15 +405,27 @@ pub enum PaginationPosition {
     Cursor(String),
 }
 
+impl PaginationPosition {
+    /// Generate JSON Schema for this type.
+    pub fn tool_input_schema() -> serde_json::Value {
+        serde_json::json!({
+            "oneOf": [
+                {"type": "integer", "description": "Page number (1-based)"},
+                {"type": "string", "description": "Cursor token from previous result"}
+            ],
+            "description": "Page number (1-based) or cursor token from previous result"
+        })
+    }
+}
+
 // =========================================================================
 // Database Switching Input
 // =========================================================================
 
 /// Input for the `switch_database` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct SwitchDatabaseInput {
     /// Name of the database to switch to.
-    #[schemars(description = "Name of the database to switch to")]
     pub database: String,
 }
 
@@ -468,15 +434,13 @@ pub struct SwitchDatabaseInput {
 // =========================================================================
 
 /// Input for the `recommend_indexes` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct RecommendIndexesInput {
-    /// The SQL query to analyze for index recommendations.
-    #[schemars(description = "SQL query to analyze for missing index recommendations")]
+    /// SQL query to analyze for missing index recommendations.
     pub query: String,
 
-    /// Whether to include existing indexes in the analysis.
+    /// Include information about existing indexes (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Include information about existing indexes (default: true)")]
     pub include_existing: bool,
 }
 
@@ -485,21 +449,16 @@ pub struct RecommendIndexesInput {
 // =========================================================================
 
 /// Input for the `compare_schemas` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct CompareSchemaInput {
-    /// Source schema for comparison.
-    #[schemars(description = "Source schema name to compare from")]
+    /// Source schema name to compare from.
     pub source_schema: String,
 
-    /// Target schema for comparison.
-    #[schemars(description = "Target schema name to compare to")]
+    /// Target schema name to compare to.
     pub target_schema: String,
 
-    /// Types of objects to compare.
+    /// Object types to compare: 'tables', 'views', 'procedures', 'all' (default: all).
     #[serde(default = "default_object_types")]
-    #[schemars(
-        description = "Object types to compare: 'tables', 'views', 'procedures', 'all' (default: all)"
-    )]
     pub object_types: String,
 }
 
@@ -508,24 +467,20 @@ fn default_object_types() -> String {
 }
 
 /// Input for the `compare_tables` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct CompareTablesInput {
-    /// Source table (schema.table format).
-    #[schemars(description = "Source table in schema.table format")]
+    /// Source table in schema.table format.
     pub source_table: String,
 
-    /// Target table (schema.table format).
-    #[schemars(description = "Target table in schema.table format")]
+    /// Target table in schema.table format.
     pub target_table: String,
 
-    /// Whether to compare indexes.
+    /// Compare indexes between tables (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Compare indexes between tables (default: true)")]
     pub compare_indexes: bool,
 
-    /// Whether to compare constraints.
+    /// Compare constraints between tables (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Compare constraints between tables (default: true)")]
     pub compare_constraints: bool,
 }
 
@@ -534,41 +489,29 @@ pub struct CompareTablesInput {
 // =========================================================================
 
 /// Input for the `sample_data` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct SampleDataInput {
-    /// Table to sample from (schema.table format).
-    #[schemars(description = "Table to sample from in schema.table format")]
+    /// Table to sample from in schema.table format.
     pub table: String,
 
-    /// Number of rows to sample.
+    /// Number of rows to sample (default: 100).
     #[serde(default = "default_sample_size")]
-    #[schemars(description = "Number of rows to sample (default: 100)")]
     pub sample_size: usize,
 
-    /// Sampling method.
+    /// Sampling method: 'random', 'top', 'bottom', 'stratified' (default: random).
     #[serde(default = "default_sampling_method")]
-    #[schemars(
-        description = "Sampling method: 'random', 'top', 'bottom', 'stratified' (default: random)"
-    )]
     pub method: String,
 
-    /// Column to stratify by (for stratified sampling).
+    /// Column to stratify by (required for stratified sampling).
     #[serde(default)]
-    #[schemars(description = "Column to stratify by (required for stratified sampling)")]
     pub stratify_column: Option<String>,
 
-    /// Optional WHERE clause filter.
+    /// Optional WHERE clause to filter rows before sampling (without 'WHERE' keyword).
     #[serde(default)]
-    #[schemars(
-        description = "Optional WHERE clause to filter rows before sampling (without 'WHERE' keyword)"
-    )]
     pub filter: Option<String>,
 
-    /// Output format for sample results.
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
     #[serde(default)]
-    #[schemars(
-        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
-    )]
     pub format: OutputFormat,
 }
 
@@ -585,25 +528,19 @@ fn default_sampling_method() -> String {
 // =========================================================================
 
 /// Input for the `bulk_insert` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct BulkInsertInput {
-    /// Target table (schema.table format).
-    #[schemars(description = "Target table in schema.table format")]
+    /// Target table in schema.table format.
     pub table: String,
 
-    /// Column names for the insert.
-    #[schemars(description = "Column names to insert into (in order)")]
+    /// Column names to insert into (in order).
     pub columns: Vec<String>,
 
-    /// Rows of data to insert (array of arrays).
-    #[schemars(
-        description = "Array of rows, where each row is an array of values matching the columns"
-    )]
+    /// Array of rows, where each row is an array of values matching the columns.
     pub rows: Vec<Vec<Value>>,
 
-    /// Batch size for chunked inserts.
+    /// Number of rows per INSERT batch (default: 1000).
     #[serde(default = "default_batch_size")]
-    #[schemars(description = "Number of rows per INSERT batch (default: 1000)")]
     pub batch_size: usize,
 }
 
@@ -612,25 +549,21 @@ fn default_batch_size() -> usize {
 }
 
 /// Input for the `export_data` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExportDataInput {
-    /// Query to export results from.
-    #[schemars(description = "SQL SELECT query to export results from")]
+    /// SQL SELECT query to export results from.
     pub query: String,
 
-    /// Export format for the data.
+    /// Export format: 'csv', 'json', 'json_lines' (default: csv).
     #[serde(default)]
-    #[schemars(description = "Export format: 'csv', 'json', 'json_lines' (default: csv)")]
     pub format: ExportFormat,
 
-    /// Include headers in CSV output.
+    /// Include column headers in CSV output (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Include column headers in CSV output (default: true)")]
     pub include_headers: bool,
 
-    /// Maximum rows to export.
+    /// Maximum rows to export (default: no limit).
     #[serde(default)]
-    #[schemars(description = "Maximum rows to export (default: no limit)")]
     pub max_rows: Option<usize>,
 }
 
@@ -639,18 +572,14 @@ pub struct ExportDataInput {
 // =========================================================================
 
 /// Input for the `get_metrics` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct GetMetricsInput {
-    /// Categories of metrics to retrieve.
+    /// Metric categories: 'connections', 'queries', 'performance', 'memory', 'all' (default: all).
     #[serde(default = "default_metrics_categories")]
-    #[schemars(
-        description = "Metric categories: 'connections', 'queries', 'performance', 'memory', 'all' (default: all)"
-    )]
     pub categories: String,
 
-    /// Time range for query statistics (in minutes).
+    /// Time range in minutes for query statistics (default: 60).
     #[serde(default = "default_metrics_range")]
-    #[schemars(description = "Time range in minutes for query statistics (default: 60)")]
     pub time_range_minutes: u64,
 }
 
@@ -667,20 +596,17 @@ fn default_metrics_range() -> u64 {
 // =========================================================================
 
 /// Input for the `analyze_query` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct AnalyzeQueryInput {
-    /// The SQL query to analyze.
-    #[schemars(description = "SQL query to analyze for performance and optimization")]
+    /// SQL query to analyze for performance and optimization.
     pub query: String,
 
-    /// Include table statistics in analysis.
+    /// Include table statistics in the analysis (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Include table statistics in the analysis (default: true)")]
     pub include_statistics: bool,
 
-    /// Include index usage analysis.
+    /// Include index usage analysis (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Include index usage analysis (default: true)")]
     pub include_index_analysis: bool,
 }
 
@@ -689,56 +615,41 @@ pub struct AnalyzeQueryInput {
 // =========================================================================
 
 /// Input for the `get_cache_stats` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct GetCacheStatsInput {
-    /// Whether to include detailed entry information.
+    /// Include detailed cache entry information (default: false).
     #[serde(default)]
-    #[schemars(description = "Include detailed cache entry information (default: false)")]
     pub detailed: bool,
 }
 
 /// Input for the `clear_cache` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ClearCacheInput {
-    /// Optional pattern to match entries to clear.
+    /// Optional pattern to match entries to clear (clears all if not specified).
     #[serde(default)]
-    #[schemars(
-        description = "Optional pattern to match entries to clear (clears all if not specified)"
-    )]
     pub pattern: Option<String>,
 }
 
 /// Input for the `execute_cached` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecuteCachedInput {
-    /// The SQL query to execute.
-    #[schemars(description = "SQL SELECT query to execute (only SELECT queries are cached)")]
+    /// SQL SELECT query to execute (only SELECT queries are cached).
     pub query: String,
 
-    /// Maximum number of rows to return.
+    /// Maximum number of rows to return (default: server configured limit).
     #[serde(default)]
-    #[schemars(
-        description = "Maximum number of rows to return (default: server configured limit)"
-    )]
     pub max_rows: Option<usize>,
 
-    /// Custom TTL in seconds for this query's cache entry.
+    /// Custom cache TTL in seconds (default: server configured TTL).
     #[serde(default)]
-    #[schemars(description = "Custom cache TTL in seconds (default: server configured TTL)")]
     pub ttl_seconds: Option<u64>,
 
-    /// Force refresh the cache (bypass existing cached result).
+    /// Force refresh the cache, ignoring existing cached result (default: false).
     #[serde(default)]
-    #[schemars(
-        description = "Force refresh the cache, ignoring existing cached result (default: false)"
-    )]
     pub force_refresh: bool,
 
-    /// Output format for query results.
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
     #[serde(default)]
-    #[schemars(
-        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
-    )]
     pub format: OutputFormat,
 }
 
@@ -747,11 +658,10 @@ pub struct ExecuteCachedInput {
 // =========================================================================
 
 /// Input for the `get_pool_metrics` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct GetPoolMetricsInput {
-    /// Whether to include connection history.
+    /// Include connection history and trends (default: false).
     #[serde(default)]
-    #[schemars(description = "Include connection history and trends (default: false)")]
     pub include_history: bool,
 }
 
@@ -760,11 +670,10 @@ pub struct GetPoolMetricsInput {
 // =========================================================================
 
 /// Input for the `get_internal_metrics` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct GetInternalMetricsInput {
-    /// Include calculated rates (queries/sec, hit rate, etc).
+    /// Include calculated rates and averages (default: true).
     #[serde(default = "default_true")]
-    #[schemars(description = "Include calculated rates and averages (default: true)")]
     pub include_rates: bool,
 }
 
@@ -773,46 +682,38 @@ pub struct GetInternalMetricsInput {
 // =========================================================================
 
 /// Input for the `begin_pinned_session` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct BeginPinnedSessionInput {
-    /// Optional session name for identification.
+    /// Optional name for the pinned session (for identification).
     #[serde(default)]
-    #[schemars(description = "Optional name for the pinned session (for identification)")]
     pub name: Option<String>,
 }
 
 /// Input for the `execute_in_pinned_session` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ExecuteInPinnedSessionInput {
-    /// Session ID returned from begin_pinned_session.
-    #[schemars(description = "Session ID from begin_pinned_session")]
+    /// Session ID from begin_pinned_session.
     pub session_id: String,
 
-    /// The SQL statement to execute within the session.
-    #[schemars(description = "SQL statement to execute within the pinned session")]
+    /// SQL statement to execute within the pinned session.
     pub query: String,
 
-    /// Output format for query results.
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
     #[serde(default)]
-    #[schemars(
-        description = "Output format: 'table' (markdown), 'json', or 'csv' (default: table)"
-    )]
     pub format: OutputFormat,
 }
 
 /// Input for the `end_pinned_session` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct EndPinnedSessionInput {
-    /// Session ID returned from begin_pinned_session.
-    #[schemars(description = "Session ID from begin_pinned_session")]
+    /// Session ID from begin_pinned_session.
     pub session_id: String,
 }
 
 /// Input for the `list_pinned_sessions` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
 pub struct ListPinnedSessionsInput {
-    /// Whether to include detailed session statistics.
+    /// Include detailed statistics for each session (default: false).
     #[serde(default)]
-    #[schemars(description = "Include detailed statistics for each session (default: false)")]
     pub detailed: bool,
 }

@@ -5,7 +5,7 @@
 //! - Circuit breaker pattern for fail-fast behavior
 //! - Bulkhead pattern (future)
 
-use crate::error::McpError;
+use crate::error::ServerError;
 use parking_lot::RwLock;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,7 +149,7 @@ pub struct RetryResult<T> {
     /// Total time spent (including delays).
     pub total_duration: Duration,
     /// The last error, if the operation failed.
-    pub last_error: Option<McpError>,
+    pub last_error: Option<ServerError>,
 }
 
 impl<T> RetryResult<T> {
@@ -159,12 +159,12 @@ impl<T> RetryResult<T> {
     }
 
     /// Convert to a standard Result.
-    pub fn into_result(self) -> Result<T, McpError> {
+    pub fn into_result(self) -> Result<T, ServerError> {
         match self.value {
             Some(v) => Ok(v),
             None => Err(self
                 .last_error
-                .unwrap_or_else(|| McpError::internal("Retry failed with no error captured"))),
+                .unwrap_or_else(|| ServerError::internal("Retry failed with no error captured"))),
         }
     }
 }
@@ -172,7 +172,7 @@ impl<T> RetryResult<T> {
 /// Execute an async operation with retry logic.
 ///
 /// The operation will be retried if it returns an error and the error
-/// is considered transient (according to `McpError::is_transient()`).
+/// is considered transient (according to `ServerError::is_transient()`).
 ///
 /// # Example
 ///
@@ -185,7 +185,7 @@ impl<T> RetryResult<T> {
 pub async fn retry_async<F, Fut, T>(config: &RetryConfig, operation: F) -> RetryResult<T>
 where
     F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, McpError>>,
+    Fut: Future<Output = Result<T, ServerError>>,
 {
     let start = std::time::Instant::now();
     let mut last_error = None;
@@ -242,10 +242,10 @@ where
 ///
 /// This is a convenience function that wraps `retry_async` and returns
 /// a standard Result.
-pub async fn with_retry<F, Fut, T>(config: &RetryConfig, operation: F) -> Result<T, McpError>
+pub async fn with_retry<F, Fut, T>(config: &RetryConfig, operation: F) -> Result<T, ServerError>
 where
     F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, McpError>>,
+    Fut: Future<Output = Result<T, ServerError>>,
 {
     retry_async(config, operation).await.into_result()
 }
@@ -444,11 +444,11 @@ impl CircuitBreaker {
 
     /// Execute an async operation through the circuit breaker.
     ///
-    /// Returns `Err(McpError::circuit_open())` if the circuit is open.
-    pub async fn call<F, Fut, T>(&self, operation: F) -> Result<T, McpError>
+    /// Returns `Err(ServerError::circuit_open())` if the circuit is open.
+    pub async fn call<F, Fut, T>(&self, operation: F) -> Result<T, ServerError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, McpError>>,
+        Fut: Future<Output = Result<T, ServerError>>,
     {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
 
@@ -456,7 +456,7 @@ impl CircuitBreaker {
         if !self.should_allow_request() {
             self.total_rejections.fetch_add(1, Ordering::Relaxed);
             debug!("Circuit breaker rejecting request (circuit open)");
-            return Err(McpError::circuit_open(self.config.reset_timeout.as_secs()));
+            return Err(ServerError::circuit_open(self.config.reset_timeout.as_secs()));
         }
 
         // Execute the operation
@@ -701,7 +701,7 @@ mod tests {
 
         let result = retry_async(&config, || async {
             counter.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, McpError>("success")
+            Ok::<_, ServerError>("success")
         })
         .await;
 
@@ -725,7 +725,7 @@ mod tests {
             let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
             async move {
                 if count < 3 {
-                    Err(McpError::timeout(30)) // Transient error
+                    Err(ServerError::timeout(30)) // Transient error
                 } else {
                     Ok("success")
                 }
@@ -745,7 +745,7 @@ mod tests {
 
         let result = retry_async(&config, || {
             counter.fetch_add(1, Ordering::SeqCst);
-            async { Err::<(), _>(McpError::auth("Invalid credentials")) }
+            async { Err::<(), _>(ServerError::auth("Invalid credentials")) }
         })
         .await;
 
@@ -767,7 +767,7 @@ mod tests {
 
         let result = retry_async(&config, || {
             counter.fetch_add(1, Ordering::SeqCst);
-            async { Err::<(), _>(McpError::timeout(30)) }
+            async { Err::<(), _>(ServerError::timeout(30)) }
         })
         .await;
 
@@ -809,7 +809,7 @@ mod tests {
         let result = breaker
             .call(|| async {
                 counter.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, McpError>("success")
+                Ok::<_, ServerError>("success")
             })
             .await;
 
@@ -836,7 +836,7 @@ mod tests {
         // Generate failures to trip the circuit
         for _ in 0..3 {
             let _ = breaker
-                .call(|| async { Err::<(), _>(McpError::timeout(30)) })
+                .call(|| async { Err::<(), _>(ServerError::timeout(30)) })
                 .await;
         }
 
@@ -845,11 +845,11 @@ mod tests {
 
         // Next call should be rejected without executing
         let result = breaker
-            .call(|| async { Ok::<_, McpError>("this should not execute") })
+            .call(|| async { Ok::<_, ServerError>("this should not execute") })
             .await;
 
         assert!(result.is_err());
-        if let Err(McpError::CircuitOpen { .. }) = result {
+        if let Err(ServerError::CircuitOpen { .. }) = result {
             // Expected
         } else {
             panic!("Expected CircuitOpen error");
@@ -873,17 +873,17 @@ mod tests {
         // Generate some failures
         for _ in 0..2 {
             let _ = breaker
-                .call(|| async { Err::<(), _>(McpError::timeout(30)) })
+                .call(|| async { Err::<(), _>(ServerError::timeout(30)) })
                 .await;
         }
 
         // Success should reset failure count
-        let _ = breaker.call(|| async { Ok::<_, McpError>(()) }).await;
+        let _ = breaker.call(|| async { Ok::<_, ServerError>(()) }).await;
 
         // Two more failures should not trip the circuit (count reset to 0 + 2)
         for _ in 0..2 {
             let _ = breaker
-                .call(|| async { Err::<(), _>(McpError::timeout(30)) })
+                .call(|| async { Err::<(), _>(ServerError::timeout(30)) })
                 .await;
         }
 
@@ -951,7 +951,7 @@ mod tests {
         // Non-transient errors should not trip the circuit
         for _ in 0..5 {
             let _ = breaker
-                .call(|| async { Err::<(), _>(McpError::auth("bad credentials")) })
+                .call(|| async { Err::<(), _>(ServerError::auth("bad credentials")) })
                 .await;
         }
 

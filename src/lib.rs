@@ -20,7 +20,6 @@ pub mod config;
 pub mod constants;
 pub mod database;
 pub mod error;
-pub mod handlers;
 pub mod prompts;
 pub mod resilience;
 pub mod resources;
@@ -33,5 +32,5 @@ pub mod tools;
 pub mod transport;
 
 pub use config::Config;
-pub use error::McpError;
+pub use error::ServerError;
 pub use server::MssqlMcpServer;

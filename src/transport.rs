@@ -296,11 +296,9 @@ pub mod http_server {
     /// Note: Full MCP functionality is best used via stdio transport.
     /// The HTTP transport provides a simplified interface for web integrations.
     async fn message_handler(
-        State(state): State<Arc<HttpServerState>>,
+        State(_state): State<Arc<HttpServerState>>,
         Json(request): Json<serde_json::Value>,
     ) -> impl IntoResponse {
-        use rmcp::handler::server::ServerHandler;
-
         info!("Received HTTP message: {:?}", request.get("method"));
 
         let method = request.get("method").and_then(|m| m.as_str());
@@ -309,23 +307,21 @@ pub mod http_server {
 
         let response = match method {
             Some("initialize") => {
-                let server = state.mcp_server.read().await;
-                let info = server.get_info();
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "protocolVersion": "2024-11-05",
+                        "protocolVersion": "2025-03-26",
                         "serverInfo": {
-                            "name": info.server_info.name,
-                            "version": info.server_info.version,
+                            "name": "mssql-mcp-server",
+                            "version": env!("CARGO_PKG_VERSION"),
                         },
                         "capabilities": {
                             "tools": {},
                             "resources": {},
                             "prompts": {},
                         },
-                        "instructions": info.instructions
+                        "instructions": "SQL Server database operations - query execution, metadata, and administration"
                     }
                 })
             }
@@ -347,9 +343,9 @@ pub mod http_server {
                 })
             }
 
-            // Note: Full MCP method routing would require rmcp's internal context handling.
+            // Note: Full MCP method routing requires the complete mcpkit request handling.
             // For production HTTP transport, consider using the stdio transport via a subprocess
-            // or implementing a full JSON-RPC router that matches rmcp's expectations.
+            // or implementing a full JSON-RPC router that matches mcpkit's expectations.
             Some(method) => {
                 info!(
                     "Method {} received - HTTP transport has limited support",
