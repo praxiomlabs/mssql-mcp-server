@@ -539,9 +539,56 @@ pub struct BulkInsertInput {
     /// Array of rows, where each row is an array of values matching the columns.
     pub rows: Vec<Vec<Value>>,
 
-    /// Number of rows per INSERT batch (default: 1000).
+    /// Number of rows per batch (default: 1000). For native BCP, this is the TDS packet batch size.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Use native SQL Server BCP (Bulk Copy Program) protocol (default: true).
+    /// BCP is significantly faster than INSERT statements for large datasets.
+    /// Falls back to INSERT statements if BCP fails or is unsupported.
+    #[serde(default = "default_true")]
+    pub use_native_bcp: bool,
+
+    /// Acquire a table lock during bulk insert (default: false).
+    /// Improves performance for large inserts but blocks other operations.
+    /// Only applies when use_native_bcp is true.
+    #[serde(default)]
+    pub table_lock: bool,
+
+    /// Fire INSERT triggers on the target table (default: false).
+    /// Only applies when use_native_bcp is true.
+    #[serde(default)]
+    pub fire_triggers: bool,
+
+    /// Check constraints during insert (default: true).
+    /// Only applies when use_native_bcp is true.
+    #[serde(default = "default_true")]
+    pub check_constraints: bool,
+
+    /// Preserve NULL values from source data (default: true).
+    /// If false, NULLs are replaced with column defaults.
+    /// Only applies when use_native_bcp is true.
+    #[serde(default = "default_true")]
+    pub keep_nulls: bool,
+
+    /// Preserve identity values from source data (default: false).
+    /// If true, identity column values are taken from the input data.
+    /// Only applies when use_native_bcp is true.
+    #[serde(default)]
+    pub keep_identity: bool,
+
+    /// Wrap all batches in a transaction for atomicity (default: false).
+    /// If true and any batch fails, all changes are rolled back.
+    /// Only applies when use_native_bcp is false (INSERT mode).
+    #[serde(default)]
+    pub use_transaction: bool,
+
+    /// Continue inserting remaining batches even if one fails (default: false).
+    /// Only applicable when use_transaction is false or combined with transaction
+    /// to allow partial commits before the failed batch.
+    /// Only applies when use_native_bcp is false (INSERT mode).
+    #[serde(default)]
+    pub continue_on_error: bool,
 }
 
 fn default_batch_size() -> usize {
@@ -716,4 +763,67 @@ pub struct ListPinnedSessionsInput {
     /// Include detailed statistics for each session (default: false).
     #[serde(default)]
     pub detailed: bool,
+}
+
+// =========================================================================
+// Validation Inputs
+// =========================================================================
+
+/// Input for the `validate_syntax_tool` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
+pub struct ValidateSyntaxInput {
+    /// SQL query to validate (check syntax without executing).
+    pub query: String,
+
+    /// Optional database context for validation.
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+// =========================================================================
+// Table-Valued Parameters (TVP) Input
+// =========================================================================
+
+/// Column definition for a table-valued parameter.
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
+pub struct TvpColumnDefinition {
+    /// Column name.
+    pub name: String,
+
+    /// SQL type (e.g., "INT", "NVARCHAR(100)", "DECIMAL(18,2)").
+    pub sql_type: String,
+}
+
+/// Input for the `execute_with_tvp` tool.
+///
+/// TVPs (Table-Valued Parameters) allow passing structured data to stored procedures
+/// as a single parameter. This is more efficient than multiple INSERT statements or
+/// temporary tables for bulk operations.
+///
+/// Prerequisites: A table type must exist in the database that matches the TVP definition.
+/// Create one with: `CREATE TYPE dbo.MyTableType AS TABLE (Column1 INT, Column2 NVARCHAR(100));`
+#[derive(Debug, Clone, Serialize, Deserialize, ToolInput)]
+pub struct ExecuteWithTvpInput {
+    /// SQL query or stored procedure call containing the TVP parameter.
+    /// Example: "EXEC MyProc @ids = @tvp" or "SELECT * FROM dbo.MyFunction(@tvp)"
+    pub query: String,
+
+    /// The TVP parameter name in the query (without @).
+    /// Example: "tvp" for @tvp parameter.
+    pub tvp_param_name: String,
+
+    /// The SQL Server table type name including schema.
+    /// Example: "dbo.IntIdList" or "dbo.UserDataType"
+    pub tvp_type_name: String,
+
+    /// Column definitions for the TVP. Must match the table type definition.
+    pub columns: Vec<TvpColumnDefinition>,
+
+    /// Row data as arrays of values. Each row must have values matching the columns.
+    /// Supports: integers, floats, strings, booleans, null, dates (ISO 8601 strings).
+    pub rows: Vec<Vec<Value>>,
+
+    /// Output format: 'table' (markdown), 'json', or 'csv' (default: table).
+    #[serde(default)]
+    pub format: OutputFormat,
 }

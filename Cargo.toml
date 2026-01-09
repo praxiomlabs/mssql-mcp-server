@@ -12,7 +12,14 @@ categories = ["database", "development-tools"]
 [features]
 default = []
 http = ["dep:mcpkit-axum", "dep:axum", "dep:tower", "dep:tower-http", "dep:hyper"]
-telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# OpenTelemetry instrumentation - enables both mssql-client spans and our metrics export
+telemetry = [
+    "mssql-client/otel",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 azure-auth = ["dep:azure_identity", "dep:azure_core"]
 
 [dependencies]

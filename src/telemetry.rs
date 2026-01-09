@@ -6,12 +6,26 @@
 //! - Connection pool statistics
 //! - Correlation ID tracking for request tracing
 //!
+//! When the `telemetry` feature is enabled, this module integrates with
+//! `mssql-client`'s OpenTelemetry instrumentation to provide:
+//! - Automatic spans for database connections, queries, and transactions
+//! - Connection pool metrics (in-use, idle, max connections)
+//! - Query operation timing and success/failure tracking
+//!
 //! Requires the `telemetry` feature flag.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+// Re-export mssql-client instrumentation types when telemetry is enabled.
+// These provide automatic OpenTelemetry spans and metrics for database operations.
+#[cfg(feature = "telemetry")]
+pub use mssql_client::instrumentation::{
+    DatabaseMetrics as MssqlDatabaseMetrics, InstrumentationContext, OperationTimer,
+    SanitizationConfig,
+};
 
 /// Generate a new correlation ID for request tracing.
 ///
@@ -391,6 +405,7 @@ impl TelemetryConfig {
 #[cfg(feature = "telemetry")]
 pub mod otel {
     use super::*;
+    use mssql_client::instrumentation::{DatabaseMetrics, InstrumentationContext, SanitizationConfig};
     use opentelemetry::metrics::{Counter, Histogram, MeterProvider, UpDownCounter};
     use opentelemetry_otlp::WithExportConfig;
     use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -470,6 +485,63 @@ pub mod otel {
                 .with_description("Number of cache misses")
                 .build(),
         }
+    }
+
+    /// Create mssql-client's DatabaseMetrics for connection pool telemetry.
+    ///
+    /// This integrates with mssql-client's OpenTelemetry instrumentation to
+    /// automatically report pool statistics as OTel metrics.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool_name` - Optional name for the pool (used in metric labels)
+    /// * `server_address` - SQL Server hostname
+    /// * `server_port` - SQL Server port
+    pub fn create_pool_metrics(
+        pool_name: Option<&str>,
+        server_address: &str,
+        server_port: u16,
+    ) -> DatabaseMetrics {
+        info!(
+            "Creating mssql-client pool metrics for {}:{}",
+            server_address, server_port
+        );
+        DatabaseMetrics::new(pool_name, server_address, server_port)
+    }
+
+    /// Create mssql-client's InstrumentationContext for query spans.
+    ///
+    /// This provides automatic OpenTelemetry span creation for:
+    /// - Connection establishment
+    /// - Query execution
+    /// - Transaction operations
+    ///
+    /// # Arguments
+    ///
+    /// * `server_address` - SQL Server hostname
+    /// * `server_port` - SQL Server port
+    /// * `database` - Database name (optional)
+    /// * `sanitize_sql` - Whether to sanitize SQL statements in spans
+    pub fn create_instrumentation_context(
+        server_address: &str,
+        server_port: u16,
+        database: Option<&str>,
+        sanitize_sql: bool,
+    ) -> InstrumentationContext {
+        let mut ctx = InstrumentationContext::new(server_address.to_string(), server_port);
+
+        if let Some(db) = database {
+            ctx = ctx.with_database(db);
+        }
+
+        if sanitize_sql {
+            // Sanitize SQL statements to avoid leaking sensitive data in traces
+            ctx = ctx.with_sanitization(SanitizationConfig::default());
+        } else {
+            ctx = ctx.with_sanitization(SanitizationConfig::no_sanitization());
+        }
+
+        ctx
     }
 }
 

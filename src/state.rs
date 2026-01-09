@@ -3,6 +3,7 @@
 use crate::database::QueryResult;
 use crate::error::ServerError;
 use chrono::{DateTime, Utc};
+use mssql_client::CancelHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +27,10 @@ pub struct SessionState {
     /// Active transactions.
     transactions: HashMap<String, TransactionState>,
 
+    /// Cancel handles for running async queries.
+    /// Maps session_id -> CancelHandle for native query cancellation.
+    cancel_handles: HashMap<String, CancelHandle>,
+
     /// Server initialization status.
     initialized: bool,
 
@@ -47,15 +52,37 @@ pub enum IsolationLevel {
     Snapshot,
 }
 
+impl IsolationLevel {
+    /// Get the full SQL statement to set this isolation level.
+    ///
+    /// This is consistent with mssql-client's IsolationLevel::as_sql() API.
+    #[must_use]
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            Self::ReadCommitted => "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            Self::RepeatableRead => "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            Self::Serializable => "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            Self::Snapshot => "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        }
+    }
+
+    /// Get the isolation level name as used in SQL Server.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "READ UNCOMMITTED",
+            Self::ReadCommitted => "READ COMMITTED",
+            Self::RepeatableRead => "REPEATABLE READ",
+            Self::Serializable => "SERIALIZABLE",
+            Self::Snapshot => "SNAPSHOT",
+        }
+    }
+}
+
 impl std::fmt::Display for IsolationLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IsolationLevel::ReadUncommitted => write!(f, "READ UNCOMMITTED"),
-            IsolationLevel::ReadCommitted => write!(f, "READ COMMITTED"),
-            IsolationLevel::RepeatableRead => write!(f, "REPEATABLE READ"),
-            IsolationLevel::Serializable => write!(f, "SERIALIZABLE"),
-            IsolationLevel::Snapshot => write!(f, "SNAPSHOT"),
-        }
+        write!(f, "{}", self.name())
     }
 }
 
@@ -348,6 +375,7 @@ impl SessionState {
         Self {
             sessions: HashMap::new(),
             transactions: HashMap::new(),
+            cancel_handles: HashMap::new(),
             initialized: false,
             default_timeout_seconds: 30,
             current_database: None,
@@ -444,6 +472,52 @@ impl SessionState {
     /// Get total session count.
     pub fn total_session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    // =========================================================================
+    // Cancel Handle Management
+    // =========================================================================
+
+    /// Store a cancel handle for a session.
+    ///
+    /// This associates a CancelHandle with a session ID, allowing native
+    /// SQL Server query cancellation via Attention packets.
+    pub fn store_cancel_handle(&mut self, session_id: &str, handle: CancelHandle) {
+        self.cancel_handles.insert(session_id.to_string(), handle);
+    }
+
+    /// Get a cancel handle for a session.
+    ///
+    /// Returns the CancelHandle if one exists for the session.
+    pub fn get_cancel_handle(&self, session_id: &str) -> Option<&CancelHandle> {
+        self.cancel_handles.get(session_id)
+    }
+
+    /// Remove a cancel handle for a session.
+    ///
+    /// Called when a session completes or is cancelled to clean up resources.
+    pub fn remove_cancel_handle(&mut self, session_id: &str) -> Option<CancelHandle> {
+        self.cancel_handles.remove(session_id)
+    }
+
+    /// Check if a session has a cancel handle.
+    pub fn has_cancel_handle(&self, session_id: &str) -> bool {
+        self.cancel_handles.contains_key(session_id)
+    }
+
+    /// Clean up cancel handles for non-running sessions.
+    ///
+    /// This removes cancel handles for sessions that are no longer running.
+    pub fn cleanup_cancel_handles(&mut self) {
+        let running_session_ids: std::collections::HashSet<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.is_running())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        self.cancel_handles
+            .retain(|id, _| running_session_ids.contains(id));
     }
 
     // =========================================================================

@@ -2,7 +2,8 @@
 
 use crate::config::Config;
 use crate::database::{
-    create_pool, ConnectionPool, MetadataQueries, QueryExecutor, SessionManager, TransactionManager,
+    create_pool, BulkInsertManager, ConnectionPool, MetadataQueries, QueryExecutor, SessionManager,
+    TransactionManager,
 };
 use crate::error::ServerError;
 use crate::security::QueryValidator;
@@ -46,6 +47,9 @@ pub struct MssqlMcpServer {
 
     /// Session manager for pinned connections (temp tables, session state).
     pub(crate) session_manager: Arc<SessionManager>,
+
+    /// Bulk insert manager for native BCP operations.
+    pub(crate) bulk_insert_manager: Arc<BulkInsertManager>,
 }
 
 impl MssqlMcpServer {
@@ -98,10 +102,13 @@ impl MssqlMcpServer {
 
         // Create session manager for pinned connections
         let session_manager = Arc::new(SessionManager::new(
-            db_config,
+            db_config.clone(),
             config.security.max_result_rows,
             config.session.result_retention, // Use result retention as session timeout
         ));
+
+        // Create bulk insert manager for native BCP operations
+        let bulk_insert_manager = Arc::new(BulkInsertManager::new(db_config));
 
         Ok(Self {
             state,
@@ -113,6 +120,7 @@ impl MssqlMcpServer {
             metrics,
             transaction_manager,
             session_manager,
+            bulk_insert_manager,
         })
     }
 
@@ -169,6 +177,11 @@ impl MssqlMcpServer {
         &self.session_manager
     }
 
+    /// Get a reference to the bulk insert manager.
+    pub fn bulk_insert_manager(&self) -> &BulkInsertManager {
+        &self.bulk_insert_manager
+    }
+
     /// Check if the server is in database mode (connected to specific database).
     pub fn is_database_mode(&self) -> bool {
         self.config.is_database_mode()
@@ -201,7 +214,8 @@ impl MssqlMcpServer {
 mod tests {
     use super::*;
     use crate::config::{
-        AuthConfig, DatabaseConfig, PoolConfig, QueryConfig, SecurityConfig, SessionConfig,
+        AuthConfig, DatabaseConfig, PoolConfig, QueryConfig, RetryConfig, SecurityConfig,
+        SessionConfig, TdsVersionConfig, TimeoutsConfig,
     };
     use crate::security::ValidationMode;
     use std::time::Duration;
@@ -211,15 +225,20 @@ mod tests {
             database: DatabaseConfig {
                 host: "localhost".to_string(),
                 port: 1433,
+                instance: None,
                 database: Some("master".to_string()),
                 auth: AuthConfig::SqlServer {
                     username: "sa".to_string(),
                     password: "test".to_string(),
                 },
                 pool: PoolConfig::default(),
+                timeouts: TimeoutsConfig::default(),
                 encrypt: false,
                 trust_server_certificate: true,
                 application_name: "test".to_string(),
+                mars: false,
+                retry: RetryConfig::default(),
+                tds_version: TdsVersionConfig::default(),
             },
             security: SecurityConfig {
                 validation_mode: ValidationMode::Standard,

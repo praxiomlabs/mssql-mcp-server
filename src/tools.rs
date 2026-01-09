@@ -5,6 +5,7 @@
 //! - `execute_query`: Execute arbitrary SQL queries
 //! - `execute_parameterized`: Execute parameterized queries (SQL injection safe)
 //! - `execute_procedure`: Execute stored procedures
+//! - `execute_with_tvp`: Execute queries with Table-Valued Parameters
 //! - `execute_async`: Start async query execution
 //! - `get_session_status`: Check async query status
 //! - `get_session_results`: Retrieve async query results
@@ -34,6 +35,7 @@
 //! - `analyze_query`: Analyze query performance
 //! - `get_pool_metrics`: Get connection pool statistics
 //! - `get_internal_metrics`: Get internal server metrics (queries, cache, etc.)
+//! - `validate_syntax`: Validate SQL syntax without executing (dry-run)
 
 mod inputs;
 
@@ -43,6 +45,7 @@ use crate::security::{parse_qualified_name, safe_identifier, validate_identifier
 use crate::server::MssqlMcpServer;
 use crate::state::{IsolationLevel, SessionStatus, TransactionStatus};
 use mcpkit::prelude::*;
+use mcpkit::types::ResourceContents;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
@@ -64,7 +67,7 @@ impl MssqlMcpServer {
     ///
     /// This tool executes arbitrary SQL queries against the database.
     /// Queries are validated according to the server's security configuration.
-    #[tool(description = "Execute a SQL query and return results. Supports SELECT, INSERT, UPDATE, DELETE based on security mode.")]
+    #[tool(description = "Execute a SQL query and return results. Supports SELECT, INSERT, UPDATE, DELETE based on security mode.", destructive = true)]
     pub async fn execute_query(
         &self,
         input: ExecuteQueryInput,
@@ -92,11 +95,11 @@ impl MssqlMcpServer {
 
         // Check execution mode on the ORIGINAL query (before USE prefix)
         // This ensures pattern detection works correctly for batch-first DDL
-        let result = if QueryExecutor::contains_go_separator(&input.query) {
+        if QueryExecutor::contains_go_separator(&input.query) {
             // Multi-batch query with GO separators
             // Pass database context so each batch gets the USE prefix
             debug!("Using multi-batch execution for script with GO separators");
-            match self
+            let result = match self
                 .executor
                 .execute_multi_batch_with_db(&input.query, current_db.as_deref())
                 .await
@@ -106,8 +109,22 @@ impl MssqlMcpServer {
                     warn!("Multi-batch execution failed: {}", e);
                     return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
                 }
-            }
-        } else if QueryExecutor::requires_raw_execution(&input.query) {
+            };
+
+            // Format output based on requested format
+            let output = match input.format {
+                OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                    warn!("Failed to serialize query result to JSON: {}", e);
+                    format!("Failed to serialize result: {}", e)
+                }),
+                OutputFormat::Csv => result.to_csv(),
+                OutputFormat::Table => result.to_markdown_table(),
+            };
+
+            return Ok(ToolOutput::text(output));
+        }
+
+        if QueryExecutor::requires_raw_execution(&input.query) {
             // Batch-first DDL statements (CREATE VIEW/PROC/FUNC/TRIGGER/SCHEMA)
             // must be executed using simple_query to avoid sp_executesql wrapper
             debug!("Using raw execution for batch-first DDL statement");
@@ -115,29 +132,73 @@ impl MssqlMcpServer {
                 Some(db) => format!("USE [{}];\n{}", db, input.query),
                 None => input.query.clone(),
             };
-            match self.executor.execute_raw(&effective_query).await {
+            let result = match self.executor.execute_raw(&effective_query).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Raw query execution failed: {}", e);
                     return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
                 }
-            }
-        } else {
-            // Standard execution with optional database context
+            };
+
+            // Format output based on requested format
+            let output = match input.format {
+                OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                    warn!("Failed to serialize query result to JSON: {}", e);
+                    format!("Failed to serialize result: {}", e)
+                }),
+                OutputFormat::Csv => result.to_csv(),
+                OutputFormat::Table => result.to_markdown_table(),
+            };
+
+            return Ok(ToolOutput::text(output));
+        }
+
+        // Check for multiple result sets (multiple SELECT statements)
+        if QueryExecutor::has_multiple_result_sets(&input.query) {
+            debug!("Using multi-result execution for query with multiple SELECTs");
             let effective_query = match &current_db {
                 Some(db) => format!("USE [{}];\n{}", db, input.query),
                 None => input.query.clone(),
             };
-            match self
+            let result = match self
                 .executor
-                .execute_with_options(&effective_query, max_rows, input.timeout_seconds)
+                .execute_multi_result(&effective_query, max_rows)
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("Query execution failed: {}", e);
+                    warn!("Multi-result query execution failed: {}", e);
                     return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
                 }
+            };
+
+            // Format output based on requested format
+            let output = match input.format {
+                OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                    warn!("Failed to serialize query result to JSON: {}", e);
+                    format!("Failed to serialize result: {}", e)
+                }),
+                OutputFormat::Csv => result.to_csv(),
+                OutputFormat::Table => result.to_markdown_table(),
+            };
+
+            return Ok(ToolOutput::text(output));
+        }
+
+        // Standard execution with optional database context
+        let effective_query = match &current_db {
+            Some(db) => format!("USE [{}];\n{}", db, input.query),
+            None => input.query.clone(),
+        };
+        let result = match self
+            .executor
+            .execute_with_options(&effective_query, max_rows, input.timeout_seconds)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Query execution failed: {}", e);
+                return Ok(ToolOutput::error(format!("Query execution failed: {}", e)));
             }
         };
 
@@ -157,7 +218,7 @@ impl MssqlMcpServer {
     /// Explain a SQL query's execution plan.
     ///
     /// Returns the estimated or actual execution plan for analysis.
-    #[tool(description = "Get the execution plan for a SQL query. Useful for query optimization.")]
+    #[tool(description = "Get the execution plan for a SQL query. Useful for query optimization.", read_only = true, idempotent = true)]
     pub async fn explain_query(
         &self,
         input: ExplainQueryInput,
@@ -187,7 +248,7 @@ impl MssqlMcpServer {
     /// Execute a stored procedure.
     ///
     /// This tool executes stored procedures with parameter binding.
-    #[tool(description = "Execute a stored procedure with parameters. Returns result sets and output parameters.")]
+    #[tool(description = "Execute a stored procedure with parameters. Returns result sets and output parameters.", destructive = true)]
     pub async fn execute_procedure(
         &self,
         input: ExecuteProcedureInput,
@@ -240,6 +301,82 @@ impl MssqlMcpServer {
         Ok(ToolOutput::text(output))
     }
 
+    /// Execute a query with a Table-Valued Parameter (TVP).
+    ///
+    /// TVPs allow passing structured data to stored procedures as a single parameter.
+    /// This is more efficient than multiple INSERT statements or temporary tables for
+    /// bulk operations.
+    ///
+    /// Prerequisites:
+    /// - A table type must exist in the database (CREATE TYPE schema.TypeName AS TABLE...)
+    /// - The query should reference the TVP parameter (e.g., @p1 or @tvp)
+    #[tool(description = "Execute a query or stored procedure with a Table-Valued Parameter (TVP). Enables efficient bulk data passing to stored procedures.", destructive = true)]
+    pub async fn execute_with_tvp(
+        &self,
+        input: ExecuteWithTvpInput,
+    ) -> Result<ToolOutput, McpError> {
+        use crate::database::QueryExecutor;
+
+        debug!(
+            "Executing query with TVP: type={}, rows={}",
+            input.tvp_type_name,
+            input.rows.len()
+        );
+
+        // Validate columns
+        if input.columns.is_empty() {
+            return Ok(ToolOutput::error("At least one column definition is required for TVP"));
+        }
+
+        // Validate rows have correct column count
+        for (idx, row) in input.rows.iter().enumerate() {
+            if row.len() != input.columns.len() {
+                return Ok(ToolOutput::error(format!(
+                    "Row {} has {} values but {} columns defined",
+                    idx,
+                    row.len(),
+                    input.columns.len()
+                )));
+            }
+        }
+
+        // Build column definitions
+        let columns: Vec<(String, String)> = input
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.sql_type.clone()))
+            .collect();
+
+        // Build the TVP
+        let tvp = match QueryExecutor::build_tvp(&input.tvp_type_name, &columns, &input.rows) {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(ToolOutput::error(format!("Failed to build TVP: {}", e)));
+            }
+        };
+
+        // Execute the query with the TVP parameter
+        let max_rows = self.config.security.max_result_rows;
+        let result = match self.executor.execute_with_tvp(&input.query, tvp, max_rows).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("TVP query execution failed: {}", e);
+                return Ok(ToolOutput::error(format!("TVP query execution failed: {}", e)));
+            }
+        };
+
+        let output = match input.format {
+            OutputFormat::Json => serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
+                warn!("Failed to serialize TVP query result to JSON: {}", e);
+                format!("Failed to serialize result: {}", e)
+            }),
+            OutputFormat::Csv => result.to_csv(),
+            OutputFormat::Table => result.to_markdown_table(),
+        };
+
+        Ok(ToolOutput::text(output))
+    }
+
     // =========================================================================
     // Async Session Tools
     // =========================================================================
@@ -247,7 +384,8 @@ impl MssqlMcpServer {
     /// Start an asynchronous query execution.
     ///
     /// Returns a session ID that can be used to check status and retrieve results.
-    #[tool(description = "Start an asynchronous query execution. Returns a session ID to check status later.")]
+    /// Supports native SQL Server query cancellation via the `cancel_session` tool.
+    #[tool(description = "Start an asynchronous query execution. Returns a session ID to check status later.", destructive = true)]
     pub async fn execute_async(
         &self,
         input: ExecuteAsyncInput,
@@ -270,8 +408,30 @@ impl MssqlMcpServer {
             }
         };
 
-        // Spawn the async execution task
-        let executor = self.executor.clone();
+        // Get a connection from the pool to access the cancel handle
+        let mut conn = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                // Clean up the session we just created
+                let mut state = self.state.write().await;
+                if let Some(session) = state.get_session_mut(&session_id) {
+                    session.fail(format!("Failed to get connection: {}", e));
+                }
+                return Ok(ToolOutput::error(format!(
+                    "Failed to get connection from pool: {}",
+                    e
+                )));
+            }
+        };
+
+        // Extract cancel handle before moving connection to spawned task
+        let cancel_handle = conn.client().map(|c| c.cancel_handle());
+        if let Some(ref handle) = cancel_handle {
+            let mut state = self.state.write().await;
+            state.store_cancel_handle(&session_id, handle.clone());
+        }
+
+        // Spawn the async execution task with the connection
         let state = self.state.clone();
         let max_rows = input
             .max_rows
@@ -281,11 +441,84 @@ impl MssqlMcpServer {
         let sid = session_id.clone();
 
         tokio::spawn(async move {
-            let result = executor
-                .execute_with_options(&query, max_rows, timeout_seconds)
-                .await;
+            use crate::database::{QueryColumnInfo as ColumnInfo, QueryResult, ResultRow, TypeMapper};
+            use futures_util::TryStreamExt;
+            use std::time::{Duration, Instant};
 
+            let start = Instant::now();
+
+            // Execute the query on the dedicated connection
+            let result = async {
+                let stream = conn
+                    .query(&query, &[])
+                    .await
+                    .map_err(|e| format!("Query execution failed: {}", e))?;
+
+                // Process the stream with row limit
+                let mut columns: Vec<ColumnInfo> = Vec::new();
+                let mut rows = Vec::new();
+                let mut truncated = false;
+                let mut row_count = 0;
+
+                futures_util::pin_mut!(stream);
+                while let Some(row) = stream.try_next().await.map_err(|e| format!("Failed to read row: {}", e))? {
+                    // Extract column info from first row
+                    if columns.is_empty() {
+                        let row_columns = row.columns();
+                        for (i, col) in row_columns.iter().enumerate() {
+                            let name = col.name.clone();
+                            let sql_type = if !col.type_name.is_empty() {
+                                col.type_name.clone()
+                            } else {
+                                let sample_value = TypeMapper::extract_column(&row, i);
+                                TypeMapper::sql_type_name_from_value(&sample_value).to_string()
+                            };
+                            columns.push(ColumnInfo {
+                                name,
+                                sql_type,
+                                nullable: col.nullable,
+                            });
+                        }
+                    }
+
+                    if row_count >= max_rows {
+                        truncated = true;
+                        break;
+                    }
+
+                    let mut result_row = ResultRow::new();
+                    for (col_idx, col) in columns.iter().enumerate() {
+                        let value = TypeMapper::extract_column(&row, col_idx);
+                        result_row.insert(col.name.clone(), value);
+                    }
+                    rows.push(result_row);
+                    row_count += 1;
+                }
+
+                Ok::<_, String>(QueryResult {
+                    columns,
+                    rows,
+                    rows_affected: 0,
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                    truncated,
+                })
+            };
+
+            // Apply timeout if specified
+            let result = if let Some(secs) = timeout_seconds {
+                match tokio::time::timeout(Duration::from_secs(secs), result).await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!("Query timed out after {} seconds", secs)),
+                }
+            } else {
+                result.await
+            };
+
+            // Update session state and clean up cancel handle
             let mut state = state.write().await;
+            // Remove the cancel handle now that the query is complete
+            state.remove_cancel_handle(&sid);
+
             if let Some(session) = state.get_session_mut(&sid) {
                 match result {
                     Ok(r) => {
@@ -294,7 +527,7 @@ impl MssqlMcpServer {
                     }
                     Err(e) => {
                         warn!("Async query {} failed: {}", sid, e);
-                        session.fail(e.to_string());
+                        session.fail(e);
                     }
                 }
             }
@@ -303,7 +536,8 @@ impl MssqlMcpServer {
         let response = json!({
             "session_id": session_id,
             "status": "running",
-            "message": "Query execution started. Use get_session_status to check progress."
+            "message": "Query execution started. Use get_session_status to check progress.",
+            "cancellable": cancel_handle.is_some()
         });
 
         Ok(ToolOutput::text(
@@ -313,7 +547,7 @@ impl MssqlMcpServer {
     }
 
     /// Get the status of an async query session.
-    #[tool(description = "Get the status and results of an async query session.")]
+    #[tool(description = "Get the status and results of an async query session.", read_only = true, idempotent = true)]
     pub async fn get_session_status(
         &self,
         input: GetSessionStatusInput,
@@ -364,37 +598,89 @@ impl MssqlMcpServer {
     }
 
     /// Cancel a running async query session.
-    #[tool(description = "Cancel a running async query session.")]
+    ///
+    /// This uses native SQL Server query cancellation via Attention packets
+    /// when available, which stops the query execution on the server side.
+    #[tool(description = "Cancel a running async query session.", destructive = true, idempotent = true)]
     pub async fn cancel_session(
         &self,
         input: CancelSessionInput,
     ) -> Result<ToolOutput, McpError> {
-        let mut state = self.state.write().await;
-
-        let session = match state.get_session_mut(&input.session_id) {
-            Some(s) => s,
-            None => {
-                return Ok(ToolOutput::error(format!(
-                    "Session not found: {}",
-                    input.session_id
-                )));
+        // First, check session exists and is running
+        let (is_running, has_cancel_handle) = {
+            let state = self.state.read().await;
+            match state.get_session(&input.session_id) {
+                Some(s) => (s.is_running(), state.has_cancel_handle(&input.session_id)),
+                None => {
+                    return Ok(ToolOutput::error(format!(
+                        "Session not found: {}",
+                        input.session_id
+                    )));
+                }
             }
         };
 
-        if !session.is_running() {
-            return Ok(ToolOutput::error(format!(
-                "Session {} is not running (status: {})",
-                input.session_id, session.status
-            )));
+        if !is_running {
+            let state = self.state.read().await;
+            if let Some(session) = state.get_session(&input.session_id) {
+                return Ok(ToolOutput::error(format!(
+                    "Session {} is not running (status: {})",
+                    input.session_id, session.status
+                )));
+            }
         }
 
-        session.cancel();
+        // Attempt native SQL Server cancellation if cancel handle is available
+        let native_cancel_result = if has_cancel_handle {
+            // Get the cancel handle and call cancel
+            // Note: We need to clone the handle since we can't hold state lock during async cancel
+            let cancel_handle = {
+                let state = self.state.read().await;
+                state.get_cancel_handle(&input.session_id).cloned()
+            };
+
+            if let Some(handle) = cancel_handle {
+                debug!("Sending native SQL Server cancellation for session {}", input.session_id);
+                match handle.cancel().await {
+                    Ok(()) => {
+                        info!("Native cancellation sent for session {}", input.session_id);
+                        Some(Ok(()))
+                    }
+                    Err(e) => {
+                        warn!("Native cancellation failed for session {}: {}", input.session_id, e);
+                        Some(Err(e.to_string()))
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Update session state
+        let mut state = self.state.write().await;
+
+        // Remove the cancel handle
+        state.remove_cancel_handle(&input.session_id);
+
+        if let Some(session) = state.get_session_mut(&input.session_id) {
+            session.cancel();
+        }
+
         info!("Session {} cancelled", input.session_id);
+
+        let message = match &native_cancel_result {
+            Some(Ok(())) => "Session cancelled with native SQL Server cancellation".to_string(),
+            Some(Err(e)) => format!("Session cancelled (native cancellation failed: {})", e),
+            None => "Session cancelled (no native cancel handle available)".to_string(),
+        };
 
         let response = json!({
             "session_id": input.session_id,
             "status": "cancelled",
-            "message": "Session cancelled successfully"
+            "native_cancellation": native_cancel_result.as_ref().map(|r| r.is_ok()).unwrap_or(false),
+            "message": message
         });
 
         Ok(ToolOutput::text(
@@ -404,7 +690,7 @@ impl MssqlMcpServer {
     }
 
     /// List all async query sessions.
-    #[tool(description = "List all async query sessions with optional status filter.")]
+    #[tool(description = "List all async query sessions with optional status filter.", read_only = true, idempotent = true)]
     pub async fn list_sessions(
         &self,
         input: ListSessionsInput,
@@ -434,7 +720,7 @@ impl MssqlMcpServer {
     /// Get the results of an async query session.
     ///
     /// Retrieves the results from a completed async query session with formatting options.
-    #[tool(description = "Get the results of a completed async query session with formatting options.")]
+    #[tool(description = "Get the results of a completed async query session with formatting options.", read_only = true, idempotent = true)]
     pub async fn get_session_results(
         &self,
         input: GetSessionResultsInput,
@@ -517,7 +803,7 @@ impl MssqlMcpServer {
     /// Check database connectivity and health.
     ///
     /// Returns connection status and optionally detailed diagnostics.
-    #[tool(description = "Test database connectivity and return health status with optional diagnostics.")]
+    #[tool(description = "Test database connectivity and return health status with optional diagnostics.", read_only = true, idempotent = true)]
     pub async fn health_check(
         &self,
         input: HealthCheckInput,
@@ -599,7 +885,7 @@ impl MssqlMcpServer {
     ///
     /// Adjusts the default timeout for query execution at runtime.
     /// This affects all subsequent queries that don't specify their own timeout.
-    #[tool(description = "Set the default query timeout in seconds. Affects subsequent query executions.")]
+    #[tool(description = "Set the default query timeout in seconds. Affects subsequent query executions.", idempotent = true)]
     pub async fn set_timeout(
         &self,
         input: SetTimeoutInput,
@@ -644,7 +930,7 @@ impl MssqlMcpServer {
     /// Get the current query timeout configuration.
     ///
     /// Returns the current default timeout and related configuration.
-    #[tool(description = "Get the current default query timeout and related configuration.")]
+    #[tool(description = "Get the current default query timeout and related configuration.", read_only = true, idempotent = true)]
     pub async fn get_timeout(
         &self,
         input: GetTimeoutInput,
@@ -682,7 +968,7 @@ impl MssqlMcpServer {
     ///
     /// This tool provides safe execution of queries with parameters,
     /// preventing SQL injection at the protocol level.
-    #[tool(description = "Execute a SQL query with parameters. Safer than raw queries as parameters are bound separately.")]
+    #[tool(description = "Execute a SQL query with parameters. Safer than raw queries as parameters are bound separately.", destructive = true)]
     pub async fn execute_parameterized(
         &self,
         input: ExecuteParameterizedInput,
@@ -749,7 +1035,7 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Begin a new database transaction.
-    #[tool(description = "Start a new database transaction with optional name and isolation level.")]
+    #[tool(description = "Start a new database transaction with optional name and isolation level.", destructive = true)]
     pub async fn begin_transaction(
         &self,
         input: BeginTransactionInput,
@@ -785,7 +1071,7 @@ impl MssqlMcpServer {
             .transaction_manager
             .begin_transaction(
                 &transaction_id,
-                &isolation_level.to_string(),
+                isolation_level,
                 input.name.as_deref(),
             )
             .await
@@ -816,7 +1102,7 @@ impl MssqlMcpServer {
     }
 
     /// Commit a transaction.
-    #[tool(description = "Commit a transaction, making all changes permanent.")]
+    #[tool(description = "Commit a transaction, making all changes permanent.", destructive = true)]
     pub async fn commit_transaction(
         &self,
         input: CommitTransactionInput,
@@ -879,7 +1165,7 @@ impl MssqlMcpServer {
     }
 
     /// Rollback a transaction.
-    #[tool(description = "Rollback a transaction, undoing all changes.")]
+    #[tool(description = "Rollback a transaction, undoing all changes.", destructive = true, idempotent = true)]
     pub async fn rollback_transaction(
         &self,
         input: RollbackTransactionInput,
@@ -953,7 +1239,7 @@ impl MssqlMcpServer {
     }
 
     /// Execute SQL within a transaction.
-    #[tool(description = "Execute a SQL statement within an active transaction.")]
+    #[tool(description = "Execute a SQL statement within an active transaction.", destructive = true)]
     pub async fn execute_in_transaction(
         &self,
         input: ExecuteInTransactionInput,
@@ -1040,7 +1326,7 @@ impl MssqlMcpServer {
     ///
     /// Pinned sessions hold a dedicated connection, allowing temp tables (#tables),
     /// session variables, and SET options to persist across multiple queries.
-    #[tool(description = "Start a pinned session with a dedicated connection. Use for temp tables (#tables) and session-scoped state that needs to persist across queries.")]
+    #[tool(description = "Start a pinned session with a dedicated connection. Use for temp tables (#tables) and session-scoped state that needs to persist across queries.", destructive = true)]
     pub async fn begin_pinned_session(
         &self,
         input: BeginPinnedSessionInput,
@@ -1085,7 +1371,7 @@ impl MssqlMcpServer {
     }
 
     /// Execute SQL within a pinned session.
-    #[tool(description = "Execute a SQL statement within a pinned session. Temp tables and session state persist across calls.")]
+    #[tool(description = "Execute a SQL statement within a pinned session. Temp tables and session state persist across calls.", destructive = true)]
     pub async fn execute_in_pinned_session(
         &self,
         input: ExecuteInPinnedSessionInput,
@@ -1126,7 +1412,7 @@ impl MssqlMcpServer {
     }
 
     /// End a pinned session and release its connection.
-    #[tool(description = "End a pinned session and release its dedicated connection. Any temp tables will be automatically dropped.")]
+    #[tool(description = "End a pinned session and release its dedicated connection. Any temp tables will be automatically dropped.", destructive = true, idempotent = true)]
     pub async fn end_pinned_session(
         &self,
         input: EndPinnedSessionInput,
@@ -1159,7 +1445,7 @@ impl MssqlMcpServer {
     }
 
     /// List all active pinned sessions.
-    #[tool(description = "List all active pinned sessions with their statistics.")]
+    #[tool(description = "List all active pinned sessions with their statistics.", read_only = true, idempotent = true)]
     pub async fn list_pinned_sessions(
         &self,
         input: ListPinnedSessionsInput,
@@ -1203,7 +1489,7 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Execute a paginated query.
-    #[tool(description = "Execute a SQL query with pagination support. Query must include ORDER BY for consistent results.")]
+    #[tool(description = "Execute a SQL query with pagination support. Query must include ORDER BY for consistent results.", read_only = true)]
     pub async fn execute_paginated(
         &self,
         input: ExecutePaginatedInput,
@@ -1307,7 +1593,7 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Switch to a different database.
-    #[tool(description = "Switch the connection to a different database on the same server.")]
+    #[tool(description = "Switch the connection to a different database on the same server.", idempotent = true)]
     pub async fn switch_database(
         &self,
         input: SwitchDatabaseInput,
@@ -1355,7 +1641,7 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Get index recommendations for a query.
-    #[tool(description = "Analyze a SQL query and recommend indexes for better performance.")]
+    #[tool(description = "Analyze a SQL query and recommend indexes for better performance.", read_only = true, idempotent = true)]
     pub async fn recommend_indexes(
         &self,
         input: RecommendIndexesInput,
@@ -1497,7 +1783,7 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Compare two database schemas.
-    #[tool(description = "Compare objects between two schemas in the same database.")]
+    #[tool(description = "Compare objects between two schemas in the same database.", read_only = true, idempotent = true)]
     pub async fn compare_schemas(
         &self,
         input: CompareSchemaInput,
@@ -1665,7 +1951,7 @@ impl MssqlMcpServer {
     }
 
     /// Compare two tables.
-    #[tool(description = "Compare the structure of two tables, including columns, indexes, and constraints.")]
+    #[tool(description = "Compare the structure of two tables, including columns, indexes, and constraints.", read_only = true, idempotent = true)]
     pub async fn compare_tables(
         &self,
         input: CompareTablesInput,
@@ -1762,7 +2048,7 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Sample data from a table.
-    #[tool(description = "Get a random or stratified sample of data from a table.")]
+    #[tool(description = "Get a random or stratified sample of data from a table.", read_only = true)]
     pub async fn sample_data(
         &self,
         input: SampleDataInput,
@@ -1874,15 +2160,18 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Bulk insert data into a table.
-    #[tool(description = "Insert multiple rows into a table efficiently using batched inserts.")]
+    #[tool(description = "Insert multiple rows into a table efficiently using batched INSERT statements. Automatically splits large datasets into batches for memory efficiency. Supports optional transaction wrapping for atomicity. Native BCP protocol support is planned for future releases.", destructive = true)]
     pub async fn bulk_insert(
         &self,
         input: BulkInsertInput,
     ) -> Result<ToolOutput, McpError> {
         debug!(
-            "Bulk inserting {} rows into {}",
+            "Bulk inserting {} rows into {} (native_bcp={}, transaction={}, continue_on_error={})",
             input.rows.len(),
-            input.table
+            input.table,
+            input.use_native_bcp,
+            input.use_transaction,
+            input.continue_on_error
         );
 
         if input.rows.is_empty() {
@@ -1908,55 +2197,144 @@ impl MssqlMcpServer {
             escaped_columns.map_err(|e| McpError::invalid_params("columns", e.to_string()))?;
 
         let batch_size = input.batch_size.clamp(1, 5000);
-        let mut total_inserted = 0;
-        let mut errors: Vec<String> = Vec::new();
 
-        // Process in batches
-        for chunk in input.rows.chunks(batch_size) {
-            let values: Vec<String> = chunk
-                .iter()
-                .map(|row| {
-                    let formatted_values: Vec<String> =
-                        row.iter().map(format_parameter_value).collect();
-                    format!("({})", formatted_values.join(", "))
-                })
-                .collect();
-
-            let insert_query = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                escaped_table,
-                escaped_columns.join(", "),
-                values.join(", ")
-            );
-
-            match self.executor.execute(&insert_query).await {
-                Ok(result) => {
-                    total_inserted += result.rows_affected as usize;
-                }
-                Err(e) => {
-                    errors.push(format!("Batch error: {}", e));
-                }
-            }
+        // Check if native BCP was requested
+        // NOTE: Native BCP is not yet available in mssql-client v0.5.2
+        // The library has BCP packet building infrastructure but doesn't expose
+        // Client.bulk_insert() yet. This will be enabled in a future release.
+        let bcp_available = self.bulk_insert_manager.is_native_bcp_available();
+        if input.use_native_bcp && !bcp_available {
+            debug!("Native BCP requested but not available, using INSERT statements");
         }
 
-        let response = json!({
-            "table": input.table,
-            "rows_requested": input.rows.len(),
-            "rows_inserted": total_inserted,
-            "batch_size": batch_size,
-            "batches": input.rows.len().div_ceil(batch_size),
-            "errors": errors,
-            "status": if errors.is_empty() { "success" } else { "partial" },
-        });
+        // Use batched INSERT statements
+        debug!("Using batched INSERT statements (batch_size={})", batch_size);
 
-        Ok(ToolOutput::text(
-            serde_json::to_string_pretty(&response)
-                .unwrap_or_else(|_| format!("Inserted {} rows", total_inserted)),
-        ))
+        // Build all INSERT statements
+        let statements: Vec<String> = input
+            .rows
+            .chunks(batch_size)
+            .map(|chunk| {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|row| {
+                        let formatted_values: Vec<String> =
+                            row.iter().map(format_parameter_value).collect();
+                        format!("({})", formatted_values.join(", "))
+                    })
+                    .collect();
+
+                format!(
+                    "INSERT INTO {} ({}) VALUES {}",
+                    escaped_table,
+                    escaped_columns.join(", "),
+                    values.join(", ")
+                )
+            })
+            .collect();
+
+        let total_batches = statements.len();
+
+        // Execute based on transaction mode
+        if input.use_transaction {
+            // Use transactional execution for atomicity
+            match self
+                .executor
+                .execute_in_transaction(&statements, input.continue_on_error)
+                .await
+            {
+                Ok(result) => {
+                    let response = json!({
+                        "table": input.table,
+                        "rows_requested": input.rows.len(),
+                        "rows_inserted": result.total_rows_affected,
+                        "batch_size": batch_size,
+                        "batches": total_batches,
+                        "successful_batches": result.successful_statements,
+                        "errors": result.errors,
+                        "status": if result.errors.is_empty() { "success" } else { "partial" },
+                        "execution_time_ms": result.execution_time_ms,
+                        "method": "insert_statements",
+                        "transaction": true,
+                        "native_bcp_requested": input.use_native_bcp,
+                        "native_bcp_available": bcp_available,
+                    });
+
+                    Ok(ToolOutput::text(
+                        serde_json::to_string_pretty(&response)
+                            .unwrap_or_else(|_| format!("Inserted {} rows", result.total_rows_affected)),
+                    ))
+                }
+                Err(e) => {
+                    let response = json!({
+                        "table": input.table,
+                        "rows_requested": input.rows.len(),
+                        "rows_inserted": 0,
+                        "batch_size": batch_size,
+                        "batches": total_batches,
+                        "status": "failed",
+                        "error": e.to_string(),
+                        "method": "insert_statements",
+                        "transaction": true,
+                        "rolled_back": true,
+                        "native_bcp_requested": input.use_native_bcp,
+                        "native_bcp_available": bcp_available,
+                    });
+
+                    Ok(ToolOutput::text(
+                        serde_json::to_string_pretty(&response)
+                            .unwrap_or_else(|_| format!("Insert failed: {}", e)),
+                    ))
+                }
+            }
+        } else {
+            // Non-transactional: execute each batch independently
+            let mut total_inserted: u64 = 0;
+            let mut successful_batches = 0;
+            let mut errors: Vec<String> = Vec::new();
+
+            for (idx, stmt) in statements.iter().enumerate() {
+                match self.executor.execute(stmt).await {
+                    Ok(result) => {
+                        total_inserted += result.rows_affected;
+                        successful_batches += 1;
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Batch {}/{} failed: {}", idx + 1, total_batches, e);
+                        errors.push(error_msg);
+
+                        if !input.continue_on_error {
+                            // Stop on first error
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let response = json!({
+                "table": input.table,
+                "rows_requested": input.rows.len(),
+                "rows_inserted": total_inserted,
+                "batch_size": batch_size,
+                "batches": total_batches,
+                "successful_batches": successful_batches,
+                "errors": errors,
+                "status": if errors.is_empty() { "success" } else if successful_batches > 0 { "partial" } else { "failed" },
+                "method": "insert_statements",
+                "transaction": false,
+                "native_bcp_requested": input.use_native_bcp,
+                "native_bcp_available": bcp_available,
+            });
+
+            Ok(ToolOutput::text(
+                serde_json::to_string_pretty(&response)
+                    .unwrap_or_else(|_| format!("Inserted {} rows", total_inserted)),
+            ))
+        }
     }
 
     /// Export query results to various formats.
-    #[tool(description = "Export query results in CSV, JSON, or JSON Lines format.")]
+    #[tool(description = "Export query results in CSV, JSON, or JSON Lines format.", read_only = true)]
     pub async fn export_data(
         &self,
         input: ExportDataInput,
@@ -2052,7 +2430,7 @@ impl MssqlMcpServer {
     // =========================================================================
 
     /// Get server performance metrics.
-    #[tool(description = "Get SQL Server performance metrics including connections, queries, and memory usage.")]
+    #[tool(description = "Get SQL Server performance metrics including connections, queries, and memory usage.", read_only = true, idempotent = true)]
     pub async fn get_metrics(
         &self,
         input: GetMetricsInput,
@@ -2190,7 +2568,7 @@ impl MssqlMcpServer {
     }
 
     /// Analyze a query for performance issues.
-    #[tool(description = "Analyze a SQL query for performance issues and optimization opportunities.")]
+    #[tool(description = "Analyze a SQL query for performance issues and optimization opportunities.", read_only = true, idempotent = true)]
     pub async fn analyze_query(
         &self,
         input: AnalyzeQueryInput,
@@ -2327,7 +2705,7 @@ impl MssqlMcpServer {
     ///
     /// Returns information about the connection pool including
     /// active connections, idle connections, and pool configuration.
-    #[tool(description = "Get connection pool metrics including active connections, idle connections, and pool health.")]
+    #[tool(description = "Get connection pool metrics including active connections, idle connections, and pool health.", read_only = true, idempotent = true)]
     pub async fn get_pool_metrics(
         &self,
         input: GetPoolMetricsInput,
@@ -2389,7 +2767,7 @@ impl MssqlMcpServer {
     ///
     /// Returns metrics collected by the server including query counts,
     /// latency statistics, cache performance, and transaction counts.
-    #[tool(description = "Get internal server metrics including query counts, latency, cache stats, and transaction counts.")]
+    #[tool(description = "Get internal server metrics including query counts, latency, cache stats, and transaction counts.", read_only = true, idempotent = true)]
     pub async fn get_internal_metrics(
         &self,
         input: GetInternalMetricsInput,
@@ -2439,11 +2817,1026 @@ impl MssqlMcpServer {
                 .unwrap_or_else(|_| "Failed to get internal metrics".to_string()),
         ))
     }
+
+    // -------------------------------------------------------------------------
+    // Validation Tools
+    // -------------------------------------------------------------------------
+
+    #[tool(description = "Validate SQL query syntax without executing. Use for dry-run validation before running DDL or complex queries.", read_only = true, idempotent = true)]
+    pub async fn validate_syntax_tool(
+        &self,
+        input: ValidateSyntaxInput,
+    ) -> Result<ToolOutput, McpError> {
+        debug!("Validating query syntax");
+
+        // If a database is specified, switch to it first
+        let effective_query = if let Some(ref db) = input.database {
+            format!("USE [{}];\n{}", db.replace(']', "]]"), input.query)
+        } else {
+            input.query.clone()
+        };
+
+        let result = self
+            .executor
+            .validate_syntax(&effective_query)
+            .await
+            .map_err(|e| McpError::internal(format!("Validation failed: {}", e)))?;
+
+        if result.valid {
+            info!("Query syntax is valid");
+        } else {
+            info!(
+                error = result.error_message.as_deref().unwrap_or("Unknown error"),
+                line = result.error_line,
+                "Query syntax validation failed"
+            );
+        }
+
+        Ok(ToolOutput::text(result.to_message()))
+    }
+
+    // =========================================================================
+    // Resources (read-only metadata access)
+    // =========================================================================
+
+    /// Get SQL Server information including version, edition, and configuration.
+    #[resource(
+        uri_pattern = "mssql://server/info",
+        name = "Server Information",
+        description = "SQL Server version, edition, and configuration details",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_server_info(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        let info = self
+            .metadata
+            .get_server_info()
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get server info: {}", e)))?;
+
+        ResourceContents::json(uri, &info)
+            .map_err(|e| McpError::internal(format!("Failed to serialize server info: {}", e)))
+    }
+
+    /// List all databases on the server.
+    #[resource(
+        uri_pattern = "mssql://databases",
+        name = "Databases",
+        description = "List of all databases on the server",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_databases(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        let databases = self
+            .metadata
+            .list_databases()
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list databases: {}", e)))?;
+
+        let response = serde_json::json!({
+            "count": databases.len(),
+            "databases": databases,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize databases: {}", e)))
+    }
+
+    /// List all schemas in the current database.
+    #[resource(
+        uri_pattern = "mssql://schemas",
+        name = "Schemas",
+        description = "List of schemas in the current database",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_schemas(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Schemas resource requires database mode (connect to a specific database)".to_string()),
+            });
+        }
+
+        let schemas = self
+            .metadata
+            .list_schemas()
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list schemas: {}", e)))?;
+
+        let response = serde_json::json!({
+            "count": schemas.len(),
+            "schemas": schemas,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize schemas: {}", e)))
+    }
+
+    /// List all tables in the current database.
+    #[resource(
+        uri_pattern = "mssql://tables",
+        name = "Tables",
+        description = "List of all tables with row counts and sizes",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_tables(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Tables resource requires database mode (connect to a specific database)".to_string()),
+            });
+        }
+
+        let tables = self
+            .metadata
+            .list_tables(None)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list tables: {}", e)))?;
+
+        let response = serde_json::json!({
+            "count": tables.len(),
+            "tables": tables,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize tables: {}", e)))
+    }
+
+    /// Get detailed information about a specific table.
+    #[resource(
+        uri_pattern = "mssql://tables/{schema}/{table}",
+        name = "Table Details",
+        description = "Get detailed information about a specific table including columns",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_table_details(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Table details resource requires database mode".to_string()),
+            });
+        }
+
+        // Parse schema and table from URI: mssql://tables/{schema}/{table}
+        let (schema, table) = parse_resource_path(uri, "tables")?;
+
+        // Validate identifiers
+        validate_identifier(&schema).map_err(|e| {
+            McpError::invalid_params("table_details", format!("Invalid schema '{}': {}", schema, e))
+        })?;
+        validate_identifier(&table).map_err(|e| {
+            McpError::invalid_params("table_details", format!("Invalid table '{}': {}", table, e))
+        })?;
+
+        let columns = self
+            .metadata
+            .get_table_columns(&schema, &table)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get table columns: {}", e)))?;
+
+        if columns.is_empty() {
+            return Err(McpError::resource_not_found(uri));
+        }
+
+        let response = serde_json::json!({
+            "schema": schema,
+            "table": table,
+            "column_count": columns.len(),
+            "columns": columns,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize table details: {}", e)))
+    }
+
+    /// List all views in the current database.
+    #[resource(
+        uri_pattern = "mssql://views",
+        name = "Views",
+        description = "List of all views in the database",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_views(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Views resource requires database mode (connect to a specific database)".to_string()),
+            });
+        }
+
+        let views = self
+            .metadata
+            .list_views(None)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list views: {}", e)))?;
+
+        let response = serde_json::json!({
+            "count": views.len(),
+            "views": views,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize views: {}", e)))
+    }
+
+    /// Get detailed information about a specific view.
+    #[resource(
+        uri_pattern = "mssql://views/{schema}/{view}",
+        name = "View Details",
+        description = "Get detailed information about a specific view including definition",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_view_details(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("View details resource requires database mode".to_string()),
+            });
+        }
+
+        let (schema, view) = parse_resource_path(uri, "views")?;
+
+        validate_identifier(&schema).map_err(|e| {
+            McpError::invalid_params("view_details", format!("Invalid schema '{}': {}", schema, e))
+        })?;
+        validate_identifier(&view).map_err(|e| {
+            McpError::invalid_params("view_details", format!("Invalid view '{}': {}", view, e))
+        })?;
+
+        let views = self
+            .metadata
+            .list_views(Some(&schema))
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list views: {}", e)))?;
+
+        let view_info = views
+            .iter()
+            .find(|v| v.view_name.eq_ignore_ascii_case(&view))
+            .ok_or_else(|| McpError::resource_not_found(uri))?;
+
+        let response = serde_json::json!({
+            "schema": view_info.schema_name,
+            "view": view_info.view_name,
+            "definition": view_info.definition,
+            "is_updatable": view_info.is_updatable,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize view details: {}", e)))
+    }
+
+    /// List all stored procedures in the current database.
+    #[resource(
+        uri_pattern = "mssql://procedures",
+        name = "Stored Procedures",
+        description = "List of stored procedures",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_procedures(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Procedures resource requires database mode (connect to a specific database)".to_string()),
+            });
+        }
+
+        let procedures = self
+            .metadata
+            .list_procedures(None)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list procedures: {}", e)))?;
+
+        let response = serde_json::json!({
+            "count": procedures.len(),
+            "procedures": procedures,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize procedures: {}", e)))
+    }
+
+    /// Get detailed information about a specific stored procedure.
+    #[resource(
+        uri_pattern = "mssql://procedures/{schema}/{procedure}",
+        name = "Procedure Details",
+        description = "Get detailed information about a stored procedure including parameters",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_procedure_details(
+        &self,
+        uri: &str,
+    ) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Procedure details resource requires database mode".to_string()),
+            });
+        }
+
+        let (schema, procedure) = parse_resource_path(uri, "procedures")?;
+
+        validate_identifier(&schema).map_err(|e| {
+            McpError::invalid_params(
+                "procedure_details",
+                format!("Invalid schema '{}': {}", schema, e),
+            )
+        })?;
+        validate_identifier(&procedure).map_err(|e| {
+            McpError::invalid_params(
+                "procedure_details",
+                format!("Invalid procedure '{}': {}", procedure, e),
+            )
+        })?;
+
+        let definition = self
+            .metadata
+            .get_procedure_definition(&schema, &procedure)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get procedure definition: {}", e)))?;
+
+        let parameters = self
+            .metadata
+            .get_procedure_parameters(&schema, &procedure)
+            .await
+            .map_err(|e| {
+                McpError::internal(format!("Failed to get procedure parameters: {}", e))
+            })?;
+
+        let response = serde_json::json!({
+            "schema": schema,
+            "procedure": procedure,
+            "definition": definition,
+            "parameter_count": parameters.len(),
+            "parameters": parameters,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize procedure details: {}", e)))
+    }
+
+    /// List all user-defined functions in the current database.
+    #[resource(
+        uri_pattern = "mssql://functions",
+        name = "Functions",
+        description = "List of user-defined functions (scalar and table-valued)",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_functions(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Functions resource requires database mode (connect to a specific database)".to_string()),
+            });
+        }
+
+        let functions = self
+            .metadata
+            .list_functions(None)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list functions: {}", e)))?;
+
+        let response = serde_json::json!({
+            "count": functions.len(),
+            "functions": functions,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize functions: {}", e)))
+    }
+
+    /// Get detailed information about a specific user-defined function.
+    #[resource(
+        uri_pattern = "mssql://functions/{schema}/{function}",
+        name = "Function Details",
+        description = "Get detailed information about a user-defined function including parameters",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_function_details(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Function details resource requires database mode".to_string()),
+            });
+        }
+
+        let (schema, function) = parse_resource_path(uri, "functions")?;
+
+        validate_identifier(&schema).map_err(|e| {
+            McpError::invalid_params(
+                "function_details",
+                format!("Invalid schema '{}': {}", schema, e),
+            )
+        })?;
+        validate_identifier(&function).map_err(|e| {
+            McpError::invalid_params(
+                "function_details",
+                format!("Invalid function '{}': {}", function, e),
+            )
+        })?;
+
+        let functions = self
+            .metadata
+            .list_functions(Some(&schema))
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list functions: {}", e)))?;
+
+        let func_info = functions
+            .iter()
+            .find(|f| f.function_name.eq_ignore_ascii_case(&function))
+            .ok_or_else(|| McpError::resource_not_found(uri))?;
+
+        let parameters = self
+            .metadata
+            .get_function_parameters(&schema, &function)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get function parameters: {}", e)))?;
+
+        let response = serde_json::json!({
+            "schema": func_info.schema_name,
+            "function": func_info.function_name,
+            "type": func_info.function_type,
+            "return_type": func_info.return_type,
+            "created": func_info.create_date,
+            "modified": func_info.modify_date,
+            "parameter_count": parameters.len(),
+            "parameters": parameters,
+            "definition": func_info.definition,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize function details: {}", e)))
+    }
+
+    /// List all triggers in the current database.
+    #[resource(
+        uri_pattern = "mssql://triggers",
+        name = "Triggers",
+        description = "List of database triggers",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_triggers(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Triggers resource requires database mode (connect to a specific database)".to_string()),
+            });
+        }
+
+        let triggers = self
+            .metadata
+            .list_triggers(None)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list triggers: {}", e)))?;
+
+        let response = serde_json::json!({
+            "count": triggers.len(),
+            "triggers": triggers,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize triggers: {}", e)))
+    }
+
+    /// Get detailed information about a specific trigger.
+    #[resource(
+        uri_pattern = "mssql://triggers/{schema}/{trigger}",
+        name = "Trigger Details",
+        description = "Get detailed information about a trigger including definition",
+        mime_type = "application/json"
+    )]
+    pub async fn resource_trigger_details(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        if !self.is_database_mode() {
+            return Err(McpError::ResourceAccessDenied {
+                uri: uri.to_string(),
+                reason: Some("Trigger details resource requires database mode".to_string()),
+            });
+        }
+
+        let (schema, trigger) = parse_resource_path(uri, "triggers")?;
+
+        validate_identifier(&schema).map_err(|e| {
+            McpError::invalid_params(
+                "trigger_details",
+                format!("Invalid schema '{}': {}", schema, e),
+            )
+        })?;
+        validate_identifier(&trigger).map_err(|e| {
+            McpError::invalid_params(
+                "trigger_details",
+                format!("Invalid trigger '{}': {}", trigger, e),
+            )
+        })?;
+
+        let triggers = self
+            .metadata
+            .list_triggers(Some(&schema))
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to list triggers: {}", e)))?;
+
+        let trigger_info = triggers
+            .iter()
+            .find(|t| t.trigger_name.eq_ignore_ascii_case(&trigger))
+            .ok_or_else(|| McpError::resource_not_found(uri))?;
+
+        let response = serde_json::json!({
+            "schema": trigger_info.schema_name,
+            "trigger": trigger_info.trigger_name,
+            "parent_object": trigger_info.parent_object,
+            "type": trigger_info.trigger_type,
+            "status": if trigger_info.is_disabled { "Disabled" } else { "Enabled" },
+            "events": trigger_info.trigger_events,
+            "created": trigger_info.create_date,
+            "modified": trigger_info.modify_date,
+            "definition": trigger_info.definition,
+        });
+
+        ResourceContents::json(uri, &response)
+            .map_err(|e| McpError::internal(format!("Failed to serialize trigger details: {}", e)))
+    }
+
+    // =========================================================================
+    // Prompts - AI-assisted SQL generation and analysis
+    // =========================================================================
+
+    /// Generate a SELECT query for a table with its schema information.
+    #[prompt(description = "Generate a SELECT query for a table with its schema information")]
+    pub async fn query_table(
+        &self,
+        schema: Option<String>,
+        table: String,
+        columns: Option<String>,
+        filter: Option<String>,
+    ) -> Result<GetPromptResult, McpError> {
+        let schema = schema.as_deref().unwrap_or("dbo");
+
+        // Get table columns from metadata
+        let column_info = self
+            .metadata
+            .get_table_columns(schema, &table)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get table columns: {}", e)))?;
+
+        if column_info.is_empty() {
+            return Err(McpError::invalid_params(
+                "query_table",
+                format!("Table not found: {}.{}", schema, table),
+            ));
+        }
+
+        // Build schema description
+        let schema_desc = column_info
+            .iter()
+            .map(|c| {
+                format!(
+                    "  - {} ({}{}){}",
+                    c.column_name,
+                    c.data_type,
+                    if c.is_nullable { ", nullable" } else { "" },
+                    if c.is_identity { " [IDENTITY]" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut prompt_text = format!(
+            r#"Generate a SELECT query for the table [{schema}].[{table}].
+
+## Table Schema
+
+{schema_desc}
+
+## Requirements
+"#
+        );
+
+        if let Some(cols) = &columns {
+            prompt_text.push_str(&format!("- Select only these columns: {}\n", cols));
+        } else {
+            prompt_text.push_str("- Select all relevant columns\n");
+        }
+
+        if let Some(f) = &filter {
+            prompt_text.push_str(&format!("- Filter condition: {}\n", f));
+        }
+
+        prompt_text.push_str(
+            r#"
+## Guidelines
+- Use proper bracket notation for identifiers: [schema].[table].[column]
+- Add appropriate TOP or OFFSET/FETCH for large tables
+- Consider using aliases for readability
+- Include ORDER BY for deterministic results
+"#,
+        );
+
+        Ok(GetPromptResult {
+            description: Some(format!("Query builder for {}.{}", schema, table)),
+            messages: vec![PromptMessage {
+                role: Role::User,
+                content: Content::text(prompt_text),
+            }],
+        })
+    }
+
+    /// Analyze a table's schema and suggest optimizations or improvements.
+    #[prompt(description = "Analyze a table's schema and suggest optimizations or improvements")]
+    pub async fn analyze_schema(
+        &self,
+        schema: Option<String>,
+        table: String,
+    ) -> Result<GetPromptResult, McpError> {
+        let schema = schema.as_deref().unwrap_or("dbo");
+
+        // Get table columns
+        let columns = self
+            .metadata
+            .get_table_columns(schema, &table)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get table columns: {}", e)))?;
+
+        if columns.is_empty() {
+            return Err(McpError::invalid_params(
+                "analyze_schema",
+                format!("Table not found: {}.{}", schema, table),
+            ));
+        }
+
+        let column_desc = columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "| {} | {} | {} | {} | {} | {} |",
+                    c.column_name,
+                    c.data_type,
+                    c.max_length.map(|l| l.to_string()).unwrap_or("-".to_string()),
+                    if c.is_nullable { "Yes" } else { "No" },
+                    if c.is_identity { "Yes" } else { "No" },
+                    c.default_value.as_deref().unwrap_or("-")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt_text = format!(
+            r#"Analyze the schema of table [{schema}].[{table}] and provide recommendations.
+
+## Current Schema
+
+| Column | Type | Max Length | Nullable | Identity | Default |
+|--------|------|------------|----------|----------|---------|
+{column_desc}
+
+## Analysis Requested
+
+Please analyze this schema and provide:
+
+1. **Data Type Review**
+   - Are the data types appropriate for the column names/purposes?
+   - Could any types be optimized (e.g., varchar(max) -> varchar(n))?
+
+2. **Nullability Assessment**
+   - Which nullable columns might benefit from NOT NULL constraints?
+   - Are there potential data integrity issues?
+
+3. **Indexing Suggestions**
+   - Based on likely query patterns, which columns should be indexed?
+   - Any composite index recommendations?
+
+4. **Best Practices**
+   - Naming convention compliance
+   - Potential normalization issues
+   - Missing audit columns (CreatedAt, UpdatedAt, etc.)
+
+5. **Performance Considerations**
+   - Data type sizes and storage efficiency
+   - Potential query performance impacts
+"#
+        );
+
+        Ok(GetPromptResult {
+            description: Some(format!("Schema analysis for {}.{}", schema, table)),
+            messages: vec![PromptMessage {
+                role: Role::User,
+                content: Content::text(prompt_text),
+            }],
+        })
+    }
+
+    /// Generate an INSERT statement template for a table.
+    #[prompt(description = "Generate an INSERT statement template for a table")]
+    pub async fn generate_insert(
+        &self,
+        schema: Option<String>,
+        table: String,
+    ) -> Result<GetPromptResult, McpError> {
+        let schema = schema.as_deref().unwrap_or("dbo");
+
+        // Get table columns
+        let columns = self
+            .metadata
+            .get_table_columns(schema, &table)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get table columns: {}", e)))?;
+
+        if columns.is_empty() {
+            return Err(McpError::invalid_params(
+                "generate_insert",
+                format!("Table not found: {}.{}", schema, table),
+            ));
+        }
+
+        // Filter out identity and computed columns
+        let insertable_columns: Vec<_> = columns
+            .iter()
+            .filter(|c| !c.is_identity && !c.is_computed)
+            .collect();
+
+        let column_list = insertable_columns
+            .iter()
+            .map(|c| format!("[{}]", c.column_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let value_placeholders = insertable_columns
+            .iter()
+            .map(|c| {
+                let placeholder = match c.data_type.to_uppercase().as_str() {
+                    "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => "0".to_string(),
+                    "BIT" => "0".to_string(),
+                    "DECIMAL" | "NUMERIC" | "MONEY" | "SMALLMONEY" => "0.00".to_string(),
+                    "FLOAT" | "REAL" => "0.0".to_string(),
+                    "DATE" => "'YYYY-MM-DD'".to_string(),
+                    "TIME" => "'HH:MM:SS'".to_string(),
+                    "DATETIME" | "DATETIME2" | "SMALLDATETIME" => "'YYYY-MM-DD HH:MM:SS'".to_string(),
+                    "UNIQUEIDENTIFIER" => "NEWID()".to_string(),
+                    _ => format!("N'<{}>'", c.column_name),
+                };
+                format!("{} /* {} {} */", placeholder, c.column_name, c.data_type)
+            })
+            .collect::<Vec<_>>()
+            .join(",\n    ");
+
+        let column_desc = insertable_columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "- {} ({}){}",
+                    c.column_name,
+                    c.data_type,
+                    if !c.is_nullable { " - REQUIRED" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt_text = format!(
+            r#"Generate an INSERT statement for [{schema}].[{table}].
+
+## Insertable Columns
+
+{column_desc}
+
+## Template
+
+```sql
+INSERT INTO [{schema}].[{table}] (
+    {column_list}
+)
+VALUES (
+    {value_placeholders}
+);
+```
+
+## Instructions
+
+Replace the placeholder values with actual data. Note:
+- Columns marked REQUIRED cannot be NULL
+- String values should use N'...' for Unicode support
+- Date/time values should use ISO format
+- UNIQUEIDENTIFIER can use NEWID() for auto-generation
+"#
+        );
+
+        Ok(GetPromptResult {
+            description: Some(format!("INSERT template for {}.{}", schema, table)),
+            messages: vec![PromptMessage {
+                role: Role::User,
+                content: Content::text(prompt_text),
+            }],
+        })
+    }
+
+    /// Explain what a stored procedure does and how to call it.
+    #[prompt(description = "Explain what a stored procedure does and how to call it")]
+    pub async fn explain_procedure(
+        &self,
+        schema: Option<String>,
+        procedure: String,
+    ) -> Result<GetPromptResult, McpError> {
+        let schema = schema.as_deref().unwrap_or("dbo");
+
+        // Get procedure definition
+        let definition = self
+            .metadata
+            .get_procedure_definition(schema, &procedure)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get procedure definition: {}", e)))?;
+
+        // Get procedure parameters
+        let parameters = self
+            .metadata
+            .get_procedure_parameters(schema, &procedure)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get procedure parameters: {}", e)))?;
+
+        let param_desc = if parameters.is_empty() {
+            "This procedure has no parameters.".to_string()
+        } else {
+            parameters
+                .iter()
+                .map(|p| {
+                    format!(
+                        "- {} ({}){}{}",
+                        p.parameter_name,
+                        p.data_type,
+                        if p.is_output { " OUTPUT" } else { "" },
+                        if p.has_default { " [has default]" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let definition_text = definition.unwrap_or_else(|| "(Definition not available)".to_string());
+
+        let prompt_text = format!(
+            r#"Explain the stored procedure [{schema}].[{procedure}].
+
+## Parameters
+
+{param_desc}
+
+## Definition
+
+```sql
+{definition_text}
+```
+
+## Please Explain
+
+1. **Purpose**: What does this procedure do?
+2. **Parameters**: Explain each parameter and its purpose
+3. **Logic Flow**: Step-by-step explanation of what happens
+4. **Return Values**: What does it return? (result sets, output parameters)
+5. **Example Usage**: Show how to call this procedure
+6. **Potential Issues**: Any edge cases or error conditions to watch for?
+"#
+        );
+
+        Ok(GetPromptResult {
+            description: Some(format!("Explanation of {}.{}", schema, procedure)),
+            messages: vec![PromptMessage {
+                role: Role::User,
+                content: Content::text(prompt_text),
+            }],
+        })
+    }
+
+    /// Analyze a SQL query and suggest optimizations.
+    #[prompt(description = "Analyze a SQL query and suggest optimizations")]
+    pub fn optimize_query(
+        &self,
+        query: String,
+    ) -> Result<GetPromptResult, McpError> {
+        let prompt_text = format!(
+            r#"Analyze and optimize the following SQL query.
+
+## Original Query
+
+```sql
+{query}
+```
+
+## Analysis Requested
+
+1. **Query Structure**
+   - Is the query logically correct?
+   - Any syntax issues or anti-patterns?
+
+2. **Performance Issues**
+   - Potential table scans
+   - Missing indexes
+   - Inefficient joins
+   - Subquery vs JOIN considerations
+
+3. **Optimizations**
+   - Rewrite suggestions
+   - Index recommendations
+   - Query hints if appropriate
+
+4. **Best Practices**
+   - SET NOCOUNT ON for procedures
+   - Avoiding SELECT *
+   - Proper use of CTEs vs temp tables
+
+5. **Optimized Version**
+   - Provide the optimized query with comments
+"#
+        );
+
+        Ok(GetPromptResult {
+            description: Some("Query optimization analysis".to_string()),
+            messages: vec![PromptMessage {
+                role: Role::User,
+                content: Content::text(prompt_text),
+            }],
+        })
+    }
+
+    /// Help debug a SQL Server error with context and suggestions.
+    #[prompt(description = "Help debug a SQL Server error with context and suggestions")]
+    pub fn debug_error(
+        &self,
+        error: String,
+        query: Option<String>,
+    ) -> Result<GetPromptResult, McpError> {
+        let mut prompt_text = format!(
+            r#"Help debug this SQL Server error.
+
+## Error Message
+
+```
+{error}
+```
+"#
+        );
+
+        if let Some(q) = &query {
+            prompt_text.push_str(&format!(
+                r#"
+## Query That Caused the Error
+
+```sql
+{q}
+```
+"#
+            ));
+        }
+
+        prompt_text.push_str(
+            r#"
+## Please Provide
+
+1. **Error Explanation**: What does this error mean?
+2. **Common Causes**: Why does this error typically occur?
+3. **Diagnosis Steps**: How to investigate further
+4. **Solutions**: How to fix the issue
+5. **Prevention**: How to avoid this error in the future
+"#,
+        );
+
+        Ok(GetPromptResult {
+            description: Some("SQL Server error debugging".to_string()),
+            messages: vec![PromptMessage {
+                role: Role::User,
+                content: Content::text(prompt_text),
+            }],
+        })
+    }
 }
 
 // =========================================================================
 // Helper Functions
 // =========================================================================
+
+/// Parse a resource path to extract schema and object name.
+///
+/// Expected format: `mssql://{type}/{schema}/{name}` or `mssql://{type}/{qualified_name}`
+fn parse_resource_path(uri: &str, resource_type: &str) -> Result<(String, String), McpError> {
+    let prefix = format!("mssql://{}/", resource_type);
+    let path = uri
+        .strip_prefix(&prefix)
+        .ok_or_else(|| McpError::invalid_params(resource_type, format!("Invalid URI: {}", uri)))?;
+
+    // Try path format first: schema/name
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        [schema, name] => Ok(((*schema).to_string(), (*name).to_string())),
+        [qualified] => {
+            // Try qualified format: schema.name
+            match parse_qualified_name(qualified) {
+                Ok((Some(schema), name)) => Ok((schema, name)),
+                Ok((None, name)) => Ok(("dbo".to_string(), name)),
+                Err(e) => Err(McpError::invalid_params(
+                    resource_type,
+                    format!("Invalid qualified name '{}': {}", qualified, e),
+                )),
+            }
+        }
+        _ => Err(McpError::invalid_params(
+            resource_type,
+            format!("Invalid resource path: {}", path),
+        )),
+    }
+}
 
 /// Truncate a string for logging.
 fn truncate_for_log(s: &str, max_len: usize) -> String {
@@ -2577,6 +3970,459 @@ fn parse_table_name(table_ref: &str) -> Result<(String, String), McpError> {
     }
 }
 
+// =========================================================================
+// CompletionHandler Implementation
+// =========================================================================
+
+use mcpkit::{CompletionHandler, Context};
+
+/// Completion suggestions for SQL Server objects.
+///
+/// Provides autocompletion for:
+/// - Resource URIs (tables, views, procedures, functions, triggers)
+/// - Prompt arguments (schema names, table names, procedure names)
+impl CompletionHandler for MssqlMcpServer {
+    /// Complete a partial resource URI.
+    ///
+    /// Supports completion for resource patterns like:
+    /// - `mssql://tables/{schema}/{table}`
+    /// - `mssql://views/{schema}/{view}`
+    /// - `mssql://procedures/{schema}/{procedure}`
+    /// - `mssql://functions/{schema}/{function}`
+    /// - `mssql://triggers/{schema}/{trigger}`
+    async fn complete_resource(
+        &self,
+        partial_uri: &str,
+        _ctx: &Context<'_>,
+    ) -> Result<Vec<String>, McpError> {
+        debug!("Completing resource URI: {}", partial_uri);
+
+        // Parse the partial URI to determine what we're completing
+        let completions = if partial_uri.starts_with("mssql://tables/") {
+            self.complete_table_resource(partial_uri).await?
+        } else if partial_uri.starts_with("mssql://views/") {
+            self.complete_view_resource(partial_uri).await?
+        } else if partial_uri.starts_with("mssql://procedures/") {
+            self.complete_procedure_resource(partial_uri).await?
+        } else if partial_uri.starts_with("mssql://functions/") {
+            self.complete_function_resource(partial_uri).await?
+        } else if partial_uri.starts_with("mssql://triggers/") {
+            self.complete_trigger_resource(partial_uri).await?
+        } else if partial_uri.starts_with("mssql://") {
+            // Complete top-level resource types
+            vec![
+                "mssql://server/info".to_string(),
+                "mssql://databases".to_string(),
+                "mssql://schemas".to_string(),
+                "mssql://tables".to_string(),
+                "mssql://views".to_string(),
+                "mssql://procedures".to_string(),
+                "mssql://functions".to_string(),
+                "mssql://triggers".to_string(),
+            ]
+            .into_iter()
+            .filter(|uri| uri.starts_with(partial_uri))
+            .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(completions)
+    }
+
+    /// Complete a partial prompt argument.
+    ///
+    /// Supports completion for prompts:
+    /// - `query_table`, `analyze_schema`, `generate_insert`: schema, table
+    /// - `explain_procedure`: schema, procedure
+    async fn complete_prompt_arg(
+        &self,
+        prompt_name: &str,
+        arg_name: &str,
+        partial_value: &str,
+        _ctx: &Context<'_>,
+    ) -> Result<Vec<String>, McpError> {
+        debug!(
+            "Completing prompt '{}' arg '{}' with prefix '{}'",
+            prompt_name, arg_name, partial_value
+        );
+
+        let completions = match (prompt_name, arg_name) {
+            // Schema completion for all prompts that have schema arguments
+            (_, "schema") => self.complete_schemas(partial_value).await?,
+
+            // Table completion for table-related prompts
+            ("query_table" | "analyze_schema" | "generate_insert", "table") => {
+                self.complete_tables(partial_value).await?
+            }
+
+            // Procedure completion for procedure-related prompts
+            ("explain_procedure", "procedure") => self.complete_procedures(partial_value).await?,
+
+            // Column completion would be context-dependent (needs table name)
+            // For now, return empty
+            (_, "columns") => Vec::new(),
+
+            // Query and error completion - no suggestions
+            (_, "query" | "error") => Vec::new(),
+
+            _ => Vec::new(),
+        };
+
+        Ok(completions)
+    }
+}
+
+/// Helper methods for completion queries.
+impl MssqlMcpServer {
+    /// Complete table resource URIs.
+    async fn complete_table_resource(&self, partial_uri: &str) -> Result<Vec<String>, McpError> {
+        let prefix = "mssql://tables/";
+        let path = partial_uri.strip_prefix(prefix).unwrap_or("");
+
+        if path.is_empty() || !path.contains('/') {
+            // Complete schema names
+            let schemas = self.get_schema_names().await?;
+            Ok(schemas
+                .into_iter()
+                .filter(|s| s.starts_with(path))
+                .map(|s| format!("{}{}/", prefix, s))
+                .collect())
+        } else {
+            // Complete table names within schema
+            let parts: Vec<&str> = path.split('/').collect();
+            let schema = parts[0];
+            let table_prefix = parts.get(1).unwrap_or(&"");
+
+            let tables = self.get_table_names(schema).await?;
+            Ok(tables
+                .into_iter()
+                .filter(|t| t.starts_with(table_prefix))
+                .map(|t| format!("{}{}/{}", prefix, schema, t))
+                .collect())
+        }
+    }
+
+    /// Complete view resource URIs.
+    async fn complete_view_resource(&self, partial_uri: &str) -> Result<Vec<String>, McpError> {
+        let prefix = "mssql://views/";
+        let path = partial_uri.strip_prefix(prefix).unwrap_or("");
+
+        if path.is_empty() || !path.contains('/') {
+            let schemas = self.get_schema_names().await?;
+            Ok(schemas
+                .into_iter()
+                .filter(|s| s.starts_with(path))
+                .map(|s| format!("{}{}/", prefix, s))
+                .collect())
+        } else {
+            let parts: Vec<&str> = path.split('/').collect();
+            let schema = parts[0];
+            let view_prefix = parts.get(1).unwrap_or(&"");
+
+            let views = self.get_view_names(schema).await?;
+            Ok(views
+                .into_iter()
+                .filter(|v| v.starts_with(view_prefix))
+                .map(|v| format!("{}{}/{}", prefix, schema, v))
+                .collect())
+        }
+    }
+
+    /// Complete procedure resource URIs.
+    async fn complete_procedure_resource(
+        &self,
+        partial_uri: &str,
+    ) -> Result<Vec<String>, McpError> {
+        let prefix = "mssql://procedures/";
+        let path = partial_uri.strip_prefix(prefix).unwrap_or("");
+
+        if path.is_empty() || !path.contains('/') {
+            let schemas = self.get_schema_names().await?;
+            Ok(schemas
+                .into_iter()
+                .filter(|s| s.starts_with(path))
+                .map(|s| format!("{}{}/", prefix, s))
+                .collect())
+        } else {
+            let parts: Vec<&str> = path.split('/').collect();
+            let schema = parts[0];
+            let proc_prefix = parts.get(1).unwrap_or(&"");
+
+            let procs = self.get_procedure_names(schema).await?;
+            Ok(procs
+                .into_iter()
+                .filter(|p| p.starts_with(proc_prefix))
+                .map(|p| format!("{}{}/{}", prefix, schema, p))
+                .collect())
+        }
+    }
+
+    /// Complete function resource URIs.
+    async fn complete_function_resource(&self, partial_uri: &str) -> Result<Vec<String>, McpError> {
+        let prefix = "mssql://functions/";
+        let path = partial_uri.strip_prefix(prefix).unwrap_or("");
+
+        if path.is_empty() || !path.contains('/') {
+            let schemas = self.get_schema_names().await?;
+            Ok(schemas
+                .into_iter()
+                .filter(|s| s.starts_with(path))
+                .map(|s| format!("{}{}/", prefix, s))
+                .collect())
+        } else {
+            let parts: Vec<&str> = path.split('/').collect();
+            let schema = parts[0];
+            let func_prefix = parts.get(1).unwrap_or(&"");
+
+            let funcs = self.get_function_names(schema).await?;
+            Ok(funcs
+                .into_iter()
+                .filter(|f| f.starts_with(func_prefix))
+                .map(|f| format!("{}{}/{}", prefix, schema, f))
+                .collect())
+        }
+    }
+
+    /// Complete trigger resource URIs.
+    async fn complete_trigger_resource(&self, partial_uri: &str) -> Result<Vec<String>, McpError> {
+        let prefix = "mssql://triggers/";
+        let path = partial_uri.strip_prefix(prefix).unwrap_or("");
+
+        if path.is_empty() || !path.contains('/') {
+            let schemas = self.get_schema_names().await?;
+            Ok(schemas
+                .into_iter()
+                .filter(|s| s.starts_with(path))
+                .map(|s| format!("{}{}/", prefix, s))
+                .collect())
+        } else {
+            let parts: Vec<&str> = path.split('/').collect();
+            let schema = parts[0];
+            let trigger_prefix = parts.get(1).unwrap_or(&"");
+
+            let triggers = self.get_trigger_names(schema).await?;
+            Ok(triggers
+                .into_iter()
+                .filter(|t| t.starts_with(trigger_prefix))
+                .map(|t| format!("{}{}/{}", prefix, schema, t))
+                .collect())
+        }
+    }
+
+    /// Complete schema names for prompt arguments.
+    async fn complete_schemas(&self, prefix: &str) -> Result<Vec<String>, McpError> {
+        let schemas = self.get_schema_names().await?;
+        Ok(schemas
+            .into_iter()
+            .filter(|s| s.to_lowercase().starts_with(&prefix.to_lowercase()))
+            .collect())
+    }
+
+    /// Complete table names for prompt arguments.
+    async fn complete_tables(&self, prefix: &str) -> Result<Vec<String>, McpError> {
+        // If prefix contains a dot, assume schema.table format
+        if let Some((schema, table_prefix)) = prefix.split_once('.') {
+            let tables = self.get_table_names(schema).await?;
+            Ok(tables
+                .into_iter()
+                .filter(|t| t.to_lowercase().starts_with(&table_prefix.to_lowercase()))
+                .map(|t| format!("{}.{}", schema, t))
+                .collect())
+        } else {
+            // Search across all schemas (limited to dbo for performance)
+            let tables = self.get_table_names("dbo").await?;
+            Ok(tables
+                .into_iter()
+                .filter(|t| t.to_lowercase().starts_with(&prefix.to_lowercase()))
+                .collect())
+        }
+    }
+
+    /// Complete procedure names for prompt arguments.
+    async fn complete_procedures(&self, prefix: &str) -> Result<Vec<String>, McpError> {
+        if let Some((schema, proc_prefix)) = prefix.split_once('.') {
+            let procs = self.get_procedure_names(schema).await?;
+            Ok(procs
+                .into_iter()
+                .filter(|p| p.to_lowercase().starts_with(&proc_prefix.to_lowercase()))
+                .map(|p| format!("{}.{}", schema, p))
+                .collect())
+        } else {
+            let procs = self.get_procedure_names("dbo").await?;
+            Ok(procs
+                .into_iter()
+                .filter(|p| p.to_lowercase().starts_with(&prefix.to_lowercase()))
+                .collect())
+        }
+    }
+
+    /// Get schema names from the database.
+    async fn get_schema_names(&self) -> Result<Vec<String>, McpError> {
+        use crate::database::types::SqlValue;
+
+        let query = "SELECT name FROM sys.schemas WHERE name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') ORDER BY name";
+        let result = self
+            .executor
+            .execute_raw(query)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get schemas: {}", e)))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.columns.get("name").and_then(|v| match v {
+                    SqlValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    /// Get table names for a schema.
+    async fn get_table_names(&self, schema: &str) -> Result<Vec<String>, McpError> {
+        use crate::database::types::SqlValue;
+
+        let safe_schema = safe_identifier(schema)
+            .map_err(|e| McpError::invalid_params("schema", e.to_string()))?;
+        let query = format!(
+            "SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('{}') ORDER BY name",
+            safe_schema
+        );
+        let result = self
+            .executor
+            .execute_raw(&query)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get tables: {}", e)))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.columns.get("name").and_then(|v| match v {
+                    SqlValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    /// Get view names for a schema.
+    async fn get_view_names(&self, schema: &str) -> Result<Vec<String>, McpError> {
+        use crate::database::types::SqlValue;
+
+        let safe_schema = safe_identifier(schema)
+            .map_err(|e| McpError::invalid_params("schema", e.to_string()))?;
+        let query = format!(
+            "SELECT name FROM sys.views WHERE schema_id = SCHEMA_ID('{}') ORDER BY name",
+            safe_schema
+        );
+        let result = self
+            .executor
+            .execute_raw(&query)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get views: {}", e)))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.columns.get("name").and_then(|v| match v {
+                    SqlValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    /// Get procedure names for a schema.
+    async fn get_procedure_names(&self, schema: &str) -> Result<Vec<String>, McpError> {
+        use crate::database::types::SqlValue;
+
+        let safe_schema = safe_identifier(schema)
+            .map_err(|e| McpError::invalid_params("schema", e.to_string()))?;
+        let query = format!(
+            "SELECT name FROM sys.procedures WHERE schema_id = SCHEMA_ID('{}') ORDER BY name",
+            safe_schema
+        );
+        let result = self
+            .executor
+            .execute_raw(&query)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get procedures: {}", e)))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.columns.get("name").and_then(|v| match v {
+                    SqlValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    /// Get function names for a schema.
+    async fn get_function_names(&self, schema: &str) -> Result<Vec<String>, McpError> {
+        use crate::database::types::SqlValue;
+
+        let safe_schema = safe_identifier(schema)
+            .map_err(|e| McpError::invalid_params("schema", e.to_string()))?;
+        let query = format!(
+            "SELECT name FROM sys.objects WHERE type IN ('FN', 'IF', 'TF') AND schema_id = SCHEMA_ID('{}') ORDER BY name",
+            safe_schema
+        );
+        let result = self
+            .executor
+            .execute_raw(&query)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get functions: {}", e)))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.columns.get("name").and_then(|v| match v {
+                    SqlValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    /// Get trigger names for a schema.
+    async fn get_trigger_names(&self, schema: &str) -> Result<Vec<String>, McpError> {
+        use crate::database::types::SqlValue;
+
+        let safe_schema = safe_identifier(schema)
+            .map_err(|e| McpError::invalid_params("schema", e.to_string()))?;
+        let query = format!(
+            "SELECT t.name FROM sys.triggers t
+             JOIN sys.objects o ON t.parent_id = o.object_id
+             WHERE o.schema_id = SCHEMA_ID('{}') ORDER BY t.name",
+            safe_schema
+        );
+        let result = self
+            .executor
+            .execute_raw(&query)
+            .await
+            .map_err(|e| McpError::internal(format!("Failed to get triggers: {}", e)))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.columns.get("name").and_then(|v| match v {
+                    SqlValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2629,5 +4475,188 @@ mod tests {
             format_parameter_value(&serde_json::json!("it's a test")),
             "N'it''s a test'"
         );
+    }
+}
+
+// =========================================================================
+// TaskHandler Implementation
+// =========================================================================
+
+use mcpkit::types::task::{Task, TaskId, TaskProgress, TaskStatus};
+use mcpkit::TaskHandler;
+
+/// Task handler for long-running SQL Server operations.
+///
+/// Maps our async query sessions to MCP tasks, providing:
+/// - Task listing (list_tasks)
+/// - Task status (get_task)
+/// - Task cancellation (cancel_task)
+///
+/// This bridges our existing session system with the MCP task protocol,
+/// allowing MCP clients to monitor and cancel long-running queries.
+impl TaskHandler for MssqlMcpServer {
+    /// List all tasks (async query sessions).
+    ///
+    /// Returns all active async query sessions as MCP tasks.
+    async fn list_tasks(&self, _ctx: &Context<'_>) -> Result<Vec<Task>, McpError> {
+        debug!("Listing all tasks");
+
+        let state = self.state.read().await;
+        let sessions = state.list_sessions();
+
+        let tasks = sessions
+            .into_iter()
+            .map(|summary| {
+                let status = match summary.status.as_str() {
+                    "running" => TaskStatus::Running,
+                    "completed" => TaskStatus::Completed,
+                    "failed" => TaskStatus::Failed,
+                    "cancelled" => TaskStatus::Cancelled,
+                    _ => TaskStatus::Pending,
+                };
+
+                let mut task = Task::new(TaskId::new(&summary.id));
+                task.status = status;
+                task.tool = Some("execute_query_async".to_string());
+                task.description = Some(summary.query_preview);
+
+                // Add progress for running tasks
+                if status == TaskStatus::Running {
+                    task.progress = Some(TaskProgress::new(summary.progress as u64).total(100));
+                }
+
+                task
+            })
+            .collect();
+
+        Ok(tasks)
+    }
+
+    /// Get a specific task by ID.
+    ///
+    /// Returns detailed information about an async query session.
+    async fn get_task(
+        &self,
+        id: &TaskId,
+        _ctx: &Context<'_>,
+    ) -> Result<Option<Task>, McpError> {
+        debug!("Getting task: {}", id);
+
+        let state = self.state.read().await;
+        let session = match state.get_session(id.as_str()) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let status = match session.status {
+            crate::state::SessionStatus::Running => TaskStatus::Running,
+            crate::state::SessionStatus::Completed => TaskStatus::Completed,
+            crate::state::SessionStatus::Failed => TaskStatus::Failed,
+            crate::state::SessionStatus::Cancelled => TaskStatus::Cancelled,
+        };
+
+        let mut task = Task::new(TaskId::new(&session.id));
+        task.status = status;
+        task.tool = Some("execute_query_async".to_string());
+        task.description = Some(truncate_for_log(&session.query, 200));
+
+        // Add progress for running tasks
+        if status == TaskStatus::Running {
+            task.progress = Some(
+                TaskProgress::new(session.progress as u64)
+                    .total(100)
+                    .message(format!("Query in progress ({}%)", session.progress)),
+            );
+        }
+
+        // Add result for completed tasks
+        if status == TaskStatus::Completed {
+            if let Some(ref result) = session.result {
+                task.result = Some(json!({
+                    "rows_affected": result.rows_affected,
+                    "row_count": result.rows.len(),
+                    "columns": result.columns,
+                }));
+            }
+        }
+
+        // Add error for failed tasks
+        if status == TaskStatus::Failed {
+            if let Some(ref error) = session.error {
+                task.error = Some(mcpkit::types::task::TaskError::new(-1, error.clone()));
+            }
+        }
+
+        Ok(Some(task))
+    }
+
+    /// Cancel a running task.
+    ///
+    /// Uses native SQL Server query cancellation via Attention packets
+    /// when a CancelHandle is available.
+    async fn cancel_task(&self, id: &TaskId, _ctx: &Context<'_>) -> Result<bool, McpError> {
+        info!("Cancelling task: {}", id);
+
+        let session_id = id.as_str();
+
+        // First, check if the session exists and is running
+        {
+            let state = self.state.read().await;
+            match state.get_session(session_id) {
+                Some(session) if session.status == crate::state::SessionStatus::Running => {
+                    // Session is running, proceed with cancellation
+                }
+                Some(_) => {
+                    // Session exists but is not running
+                    return Ok(false);
+                }
+                None => {
+                    // Session doesn't exist
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Attempt native SQL Server cancellation via CancelHandle
+        let mut state = self.state.write().await;
+
+        // Try to get and use the cancel handle
+        if let Some(handle) = state.get_cancel_handle(session_id) {
+            // Clone the handle to use outside the borrow
+            let handle = handle.clone();
+            drop(state); // Release the lock before async operation
+
+            // Send cancellation request via Attention packet
+            match handle.cancel().await {
+                Ok(()) => {
+                    debug!("Native cancellation sent for task {}", id);
+                }
+                Err(e) => {
+                    warn!("Failed to send native cancellation for task {}: {}", id, e);
+                    // Continue to mark as cancelled anyway
+                }
+            }
+
+            // Re-acquire lock to update state
+            let mut state = self.state.write().await;
+
+            // Mark the session as cancelled
+            if let Some(session) = state.get_session_mut(session_id) {
+                session.cancel();
+            }
+
+            // Clean up the cancel handle
+            state.remove_cancel_handle(session_id);
+
+            return Ok(true);
+        }
+
+        // No cancel handle - just mark as cancelled
+        if let Some(session) = state.get_session_mut(session_id) {
+            session.cancel();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }

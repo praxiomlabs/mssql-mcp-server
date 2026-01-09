@@ -6,10 +6,21 @@
 //! - Windows authentication (SSPI/Kerberos)
 //! - Azure AD authentication (service principal with client credentials)
 
-use crate::config::{AuthConfig, DatabaseConfig};
+use crate::config::{AuthConfig, DatabaseConfig, TdsVersionConfig};
 use crate::error::ServerError;
-use mssql_client::{Client, Config, Credentials, Ready};
+use mssql_client::{Client, Config, Credentials, Ready, RetryPolicy, TdsVersion, TimeoutConfig};
+use std::time::Duration;
 use tracing::debug;
+
+/// Convert our TdsVersionConfig to mssql_client's TdsVersion.
+fn convert_tds_version(version: TdsVersionConfig) -> TdsVersion {
+    match version {
+        TdsVersionConfig::V7_3A => TdsVersion::V7_3A,
+        TdsVersionConfig::V7_3B => TdsVersion::V7_3B,
+        TdsVersionConfig::V7_4 => TdsVersion::V7_4,
+        TdsVersionConfig::V8_0 => TdsVersion::V8_0,
+    }
+}
 
 /// Type alias for a raw mssql-client connection in Ready state.
 pub type RawConnection = Client<Ready>;
@@ -97,9 +108,26 @@ async fn acquire_azure_ad_token(
 /// Create a mssql-client Config from DatabaseConfig.
 ///
 /// This sets up the connection configuration including host, port, database,
-/// encryption settings, and authentication credentials.
+/// encryption settings, authentication credentials, retry policy, and instance.
 pub async fn create_config(db_config: &DatabaseConfig) -> Result<Config, ServerError> {
     let credentials = build_credentials(&db_config.auth).await?;
+
+    // Build retry policy from configuration
+    let retry_policy = RetryPolicy::new()
+        .max_retries(db_config.retry.max_retries)
+        .initial_backoff(Duration::from_millis(db_config.retry.initial_backoff_ms))
+        .max_backoff(Duration::from_millis(db_config.retry.max_backoff_ms))
+        .backoff_multiplier(db_config.retry.backoff_multiplier)
+        .jitter(db_config.retry.jitter);
+
+    // Build timeout config from our configuration
+    let timeout_config = TimeoutConfig::new()
+        .connect_timeout(db_config.timeouts.connect_timeout)
+        .tls_timeout(db_config.timeouts.tls_timeout)
+        .login_timeout(db_config.timeouts.login_timeout)
+        .command_timeout(db_config.timeouts.command_timeout)
+        .idle_timeout(db_config.timeouts.idle_timeout)
+        .keepalive_interval(db_config.timeouts.keepalive_interval);
 
     let mut config = Config::new()
         .host(&db_config.host)
@@ -107,12 +135,23 @@ pub async fn create_config(db_config: &DatabaseConfig) -> Result<Config, ServerE
         .credentials(credentials)
         .application_name(&db_config.application_name)
         .trust_server_certificate(db_config.trust_server_certificate)
-        .encrypt(db_config.encrypt);
+        .encrypt(db_config.encrypt)
+        .retry(retry_policy)
+        .timeouts(timeout_config)
+        .tds_version(convert_tds_version(db_config.tds_version));
 
     // Set database if specified
     if let Some(ref database) = db_config.database {
         config = config.database(database);
     }
+
+    // Set named instance if specified
+    if let Some(ref instance) = db_config.instance {
+        config.instance = Some(instance.clone());
+    }
+
+    // Set MARS if enabled
+    config.mars = db_config.mars;
 
     Ok(config)
 }
@@ -128,18 +167,46 @@ pub async fn create_config_with_suffix(
 
     let app_name = format!("{}-{}", db_config.application_name, suffix);
 
+    // Build retry policy from configuration
+    let retry_policy = RetryPolicy::new()
+        .max_retries(db_config.retry.max_retries)
+        .initial_backoff(Duration::from_millis(db_config.retry.initial_backoff_ms))
+        .max_backoff(Duration::from_millis(db_config.retry.max_backoff_ms))
+        .backoff_multiplier(db_config.retry.backoff_multiplier)
+        .jitter(db_config.retry.jitter);
+
+    // Build timeout config from our configuration
+    let timeout_config = TimeoutConfig::new()
+        .connect_timeout(db_config.timeouts.connect_timeout)
+        .tls_timeout(db_config.timeouts.tls_timeout)
+        .login_timeout(db_config.timeouts.login_timeout)
+        .command_timeout(db_config.timeouts.command_timeout)
+        .idle_timeout(db_config.timeouts.idle_timeout)
+        .keepalive_interval(db_config.timeouts.keepalive_interval);
+
     let mut config = Config::new()
         .host(&db_config.host)
         .port(db_config.port)
         .credentials(credentials)
         .application_name(&app_name)
         .trust_server_certificate(db_config.trust_server_certificate)
-        .encrypt(db_config.encrypt);
+        .encrypt(db_config.encrypt)
+        .retry(retry_policy)
+        .timeouts(timeout_config)
+        .tds_version(convert_tds_version(db_config.tds_version));
 
     // Set database if specified
     if let Some(ref database) = db_config.database {
         config = config.database(database);
     }
+
+    // Set named instance if specified
+    if let Some(ref instance) = db_config.instance {
+        config.instance = Some(instance.clone());
+    }
+
+    // Set MARS if enabled
+    config.mars = db_config.mars;
 
     Ok(config)
 }
@@ -189,21 +256,26 @@ pub fn truncate_for_log(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PoolConfig;
+    use crate::config::{PoolConfig, RetryConfig, TimeoutsConfig};
 
     fn test_db_config() -> DatabaseConfig {
         DatabaseConfig {
             host: "localhost".to_string(),
             port: 1433,
+            instance: None,
             database: Some("master".to_string()),
             auth: AuthConfig::SqlServer {
                 username: "sa".to_string(),
                 password: "test".to_string(),
             },
             pool: PoolConfig::default(),
+            timeouts: TimeoutsConfig::default(),
             encrypt: false,
             trust_server_certificate: true,
             application_name: "test".to_string(),
+            mars: false,
+            retry: RetryConfig::default(),
+            tds_version: TdsVersionConfig::default(),
         }
     }
 

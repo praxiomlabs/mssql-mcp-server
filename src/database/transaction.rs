@@ -9,6 +9,7 @@ use crate::config::DatabaseConfig;
 use crate::database::query::{ColumnInfo, QueryResult, ResultRow};
 use crate::database::types::TypeMapper;
 use crate::error::ServerError;
+use crate::state::IsolationLevel;
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,25 +50,24 @@ impl TransactionManager {
 
     /// Begin a new transaction and store its dedicated connection.
     ///
-    /// Returns the transaction ID if successful.
+    /// Uses the native IsolationLevel enum for type safety, consistent with mssql-client's API.
     pub async fn begin_transaction(
         &self,
         transaction_id: &str,
-        isolation_level: &str,
+        isolation_level: IsolationLevel,
         name: Option<&str>,
     ) -> Result<(), ServerError> {
         // Create a dedicated connection for this transaction
         let mut conn = self.create_txn_connection().await?;
 
-        // Set isolation level and begin transaction
-        let set_isolation = format!("SET TRANSACTION ISOLATION LEVEL {}", isolation_level);
+        // Set isolation level using the as_sql() method (matches mssql-client API)
         let begin_tx = match name {
             Some(n) => format!("BEGIN TRANSACTION [{}]", n.replace(']', "]]")),
             None => "BEGIN TRANSACTION".to_string(),
         };
 
         // Execute as separate statements on the same connection
-        conn.execute(&set_isolation, &[])
+        conn.execute(isolation_level.as_sql(), &[])
             .await
             .map_err(|e| ServerError::query_error(format!("Failed to set isolation level: {}", e)))?;
 
@@ -80,8 +80,9 @@ impl TransactionManager {
         connections.insert(transaction_id.to_string(), conn);
 
         debug!(
-            "Transaction {} started with dedicated connection",
-            transaction_id
+            transaction_id = transaction_id,
+            isolation_level = %isolation_level,
+            "Transaction started with dedicated connection"
         );
         Ok(())
     }

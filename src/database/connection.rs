@@ -74,21 +74,26 @@ pub struct PoolStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuthConfig, PoolConfig};
+    use crate::config::{AuthConfig, PoolConfig, RetryConfig, TdsVersionConfig, TimeoutsConfig};
 
     fn test_config() -> DatabaseConfig {
         DatabaseConfig {
             host: "localhost".to_string(),
             port: 1433,
+            instance: None,
             database: Some("master".to_string()),
             auth: AuthConfig::SqlServer {
                 username: "sa".to_string(),
                 password: "test".to_string(),
             },
             pool: PoolConfig::default(),
+            timeouts: TimeoutsConfig::default(),
             encrypt: false,
             trust_server_certificate: true,
             application_name: "test".to_string(),
+            mars: false,
+            retry: RetryConfig::default(),
+            tds_version: TdsVersionConfig::default(),
         }
     }
 

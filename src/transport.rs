@@ -86,6 +86,12 @@ pub struct HttpConfig {
     /// Allowed origins for CORS (empty means all).
     pub cors_origins: Vec<String>,
 
+    /// Enable request tracing via tower-http TraceLayer.
+    ///
+    /// When enabled, all HTTP requests are traced with structured logging
+    /// including request method, path, status code, and latency.
+    pub enable_tracing: bool,
+
     /// Request timeout in seconds.
     pub request_timeout_seconds: u64,
 
@@ -106,6 +112,7 @@ impl Default for HttpConfig {
             port: 3000,
             enable_cors: true,
             cors_origins: Vec::new(),
+            enable_tracing: true, // Enabled by default for observability
             request_timeout_seconds: 30,
             max_body_size: 10 * 1024 * 1024, // 10MB
             rate_limit_enabled: true,
@@ -137,6 +144,10 @@ impl HttpConfig {
             config.cors_origins = origins.split(',').map(|s| s.trim().to_string()).collect();
         }
 
+        if let Ok(tracing) = std::env::var("MSSQL_HTTP_TRACING") {
+            config.enable_tracing = tracing.to_lowercase() == "true" || tracing == "1";
+        }
+
         if let Ok(timeout) = std::env::var("MSSQL_HTTP_TIMEOUT") {
             if let Ok(t) = timeout.parse() {
                 config.request_timeout_seconds = t;
@@ -157,34 +168,22 @@ impl HttpConfig {
     }
 }
 
-/// HTTP server implementation (only available with `http` feature).
+/// HTTP server implementation using mcpkit-axum (only available with `http` feature).
+///
+/// This provides full MCP functionality over HTTP, including:
+/// - JSON-RPC message handling at `/mcp`
+/// - Server-Sent Events streaming at `/mcp/sse`
+/// - All tools, resources, and prompts from the MssqlMcpServer
 #[cfg(feature = "http")]
 pub mod http_server {
     use super::*;
     use crate::shutdown::SharedShutdownController;
     use crate::MssqlMcpServer;
-    use axum::{
-        extract::State,
-        http::{header, Method},
-        response::{sse::Event, IntoResponse, Sse},
-        routing::{get, post},
-        Json, Router,
-    };
-    use std::convert::Infallible;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::sync::RwLock;
-    use tower_http::cors::{Any, CorsLayer};
+    use axum::{response::IntoResponse, routing::get, Json, Router};
+    use mcpkit_axum::McpRouter;
     use tracing::info;
 
-    /// Shared server state for HTTP handlers.
-    pub struct HttpServerState {
-        pub mcp_server: Arc<RwLock<MssqlMcpServer>>,
-        pub config: HttpConfig,
-        pub shutdown_controller: Option<SharedShutdownController>,
-    }
-
-    /// Start the HTTP server.
+    /// Start the HTTP server with full MCP support.
     pub async fn start_http_server(
         mcp_server: MssqlMcpServer,
         config: HttpConfig,
@@ -193,54 +192,52 @@ pub mod http_server {
     }
 
     /// Start the HTTP server with graceful shutdown support.
+    ///
+    /// Uses mcpkit-axum's `McpRouter` for full MCP protocol support:
+    /// - All 32+ tools are available over HTTP
+    /// - All resources are accessible
+    /// - All prompts work correctly
+    ///
+    /// Custom endpoints:
+    /// - `/health` - Health check endpoint
+    /// - `/` - Also serves health check
     pub async fn start_http_server_with_shutdown(
         mcp_server: MssqlMcpServer,
         config: HttpConfig,
         shutdown_controller: Option<SharedShutdownController>,
     ) -> Result<(), anyhow::Error> {
-        let state = Arc::new(HttpServerState {
-            mcp_server: Arc::new(RwLock::new(mcp_server)),
-            config: config.clone(),
-            shutdown_controller: shutdown_controller.clone(),
-        });
+        // Build MCP router with mcpkit-axum for full protocol support
+        let mut mcp_router = McpRouter::new(mcp_server)
+            .post_path("/mcp")
+            .sse_path("/mcp/sse");
 
-        // Build CORS layer
-        let cors = if config.enable_cors {
-            if config.cors_origins.is_empty() {
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-            } else {
-                let origins: Vec<_> = config
-                    .cors_origins
-                    .iter()
-                    .filter_map(|o| o.parse().ok())
-                    .collect();
-                CorsLayer::new()
-                    .allow_origin(origins)
-                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-            }
-        } else {
-            CorsLayer::new()
-        };
+        // Enable CORS if configured
+        if config.enable_cors {
+            mcp_router = mcp_router.with_cors();
+        }
 
-        // Build router
+        // Enable request tracing if configured
+        // This adds tower-http TraceLayer for structured request/response logging
+        if config.enable_tracing {
+            mcp_router = mcp_router.with_tracing();
+        }
+
+        // Merge with custom health endpoints
         let app = Router::new()
-            .route("/", get(health_handler))
             .route("/health", get(health_handler))
-            .route("/sse", get(sse_handler))
-            .route("/message", post(message_handler))
-            .layer(cors)
-            .with_state(state);
+            .route("/", get(health_handler))
+            .merge(mcp_router.into_router());
 
         let addr = format!("{}:{}", config.host, config.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         info!("HTTP server listening on http://{}", addr);
-        info!("SSE endpoint: http://{}/sse", addr);
-        info!("Message endpoint: http://{}/message", addr);
+        info!("MCP endpoint: http://{}/mcp", addr);
+        info!("SSE endpoint: http://{}/mcp/sse", addr);
+        info!("Health endpoint: http://{}/health", addr);
+        if config.enable_tracing {
+            info!("Request tracing enabled");
+        }
 
         // Start server with graceful shutdown if controller is provided
         if let Some(controller) = shutdown_controller {
@@ -265,116 +262,11 @@ pub mod http_server {
             "server": "mssql-mcp-server",
             "version": env!("CARGO_PKG_VERSION"),
             "transport": "http",
+            "endpoints": {
+                "mcp": "/mcp",
+                "sse": "/mcp/sse",
+                "health": "/health"
+            }
         }))
-    }
-
-    /// SSE connection handler for streaming responses.
-    async fn sse_handler(
-        State(_state): State<Arc<HttpServerState>>,
-    ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-        use futures_util::stream;
-
-        info!("New SSE connection established");
-
-        // Create a simple ping stream to keep connection alive
-        let stream = stream::repeat_with(|| {
-            Ok(Event::default().event("ping").data(
-                serde_json::json!({"timestamp": chrono::Utc::now().to_rfc3339()}).to_string(),
-            ))
-        });
-
-        Sse::new(stream).keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        )
-    }
-
-    /// Message handler for JSON-RPC requests.
-    ///
-    /// This handler provides basic MCP protocol support over HTTP.
-    /// Note: Full MCP functionality is best used via stdio transport.
-    /// The HTTP transport provides a simplified interface for web integrations.
-    async fn message_handler(
-        State(_state): State<Arc<HttpServerState>>,
-        Json(request): Json<serde_json::Value>,
-    ) -> impl IntoResponse {
-        info!("Received HTTP message: {:?}", request.get("method"));
-
-        let method = request.get("method").and_then(|m| m.as_str());
-        let id = request.get("id").cloned();
-        let _params = request.get("params").cloned();
-
-        let response = match method {
-            Some("initialize") => {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": "2025-03-26",
-                        "serverInfo": {
-                            "name": "mssql-mcp-server",
-                            "version": env!("CARGO_PKG_VERSION"),
-                        },
-                        "capabilities": {
-                            "tools": {},
-                            "resources": {},
-                            "prompts": {},
-                        },
-                        "instructions": "SQL Server database operations - query execution, metadata, and administration"
-                    }
-                })
-            }
-
-            Some("initialized") | Some("notifications/initialized") => {
-                // Client acknowledging initialization
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {}
-                })
-            }
-
-            Some("ping") => {
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {}
-                })
-            }
-
-            // Note: Full MCP method routing requires the complete mcpkit request handling.
-            // For production HTTP transport, consider using the stdio transport via a subprocess
-            // or implementing a full JSON-RPC router that matches mcpkit's expectations.
-            Some(method) => {
-                info!(
-                    "Method {} received - HTTP transport has limited support",
-                    method
-                );
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!(
-                            "Method '{}' is not fully supported over HTTP transport. \
-                             For full MCP functionality, use the stdio transport.",
-                            method
-                        )
-                    }
-                })
-            }
-
-            None => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32600,
-                    "message": "Invalid request: missing method"
-                }
-            }),
-        };
-
-        Json(response)
     }
 }
